@@ -1,0 +1,63 @@
+{
+    "name": "Light",
+    "description": "Clean white theme with blue accents",
+
+    "bg_color":     "#f0f4f8",
+    "glass_bg":     "#ffffff",
+    "glass_accent": "#e2e8f0",
+    "fg_color":     "#1a202c",
+    "accent_1":     "#3b82f6",
+    "accent_2":     "#ef4444",
+    "accent_3":     "#8b5cf6",
+    "accent_4":     "#06b6d4",
+
+    "chat_bg":          "#ffffff",
+    "chat_fg":          "#1a202c",
+    "chat_font":        "Segoe UI",
+    "chat_font_size":   10,
+
+    "entry_bg":         "#f8fafc",
+    "entry_fg":         "#1a202c",
+
+    "userlist_bg":      "#e2e8f0",
+    "userlist_card_bg": "#f8fafc",
+
+    "titlebar_bg":      "#e2e8f0",
+    "titlebar_fg":      "#1a202c",
+    "titlebar_sep":     "#3b82f6",
+
+    "scrollbar_bg":     "#e2e8f0",
+    "scrollbar_trough": "#f0f4f8",
+
+    "send_btn_bg":      "#3b82f6",
+    "send_btn_fg":      "#ffffff",
+
+    "voice_idle_bg":    "#8b5cf6",
+    "voice_idle_fg":    "#ffffff",
+    "voice_active_bg":  "#ef4444",
+    "voice_active_fg":  "#ffffff",
+
+    "header_bg":        "#e2e8f0",
+    "header_fg":        "#3b82f6",
+
+    "status_fg":        "#06b6d4",
+
+    "system_msg_color": "#6b7280",
+
+    "login_bg":         "#f0f4f8",
+    "login_form_bg":    "#ffffff",
+    "login_field_bg":   "#f8fafc",
+    "login_fg":         "#1a202c",
+    "login_label_fg":   "#6b7280",
+    "login_cursor":     "#3b82f6",
+    "login_btn_bg":     "#3b82f6",
+    "login_btn_fg":     "#ffffff",
+    "login_error_bg":   "#fee2e2",
+    "login_error_fg":   "#dc2626",
+    "login_title_fg":   "#3b82f6",
+    "login_sub_fg":     "#6b7280",
+
+    "gradient_start":   [240, 244, 248],
+    "gradient_end":     [220, 230, 242],
+    "gradient_lines":   "#3b82f6"
+}

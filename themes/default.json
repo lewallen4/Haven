@@ -1,0 +1,63 @@
+{
+    "name": "Default",
+    "description": "The original Haven neon dark theme",
+
+    "bg_color":     "#0a0a1a",
+    "glass_bg":     "#1a1a2e",
+    "glass_accent": "#16213e",
+    "fg_color":     "#eeeeee",
+    "accent_1":     "#00ff88",
+    "accent_2":     "#ff006e",
+    "accent_3":     "#8338ec",
+    "accent_4":     "#06ffa5",
+
+    "chat_bg":          "#1a1a2e",
+    "chat_fg":          "#eeeeee",
+    "chat_font":        "Consolas",
+    "chat_font_size":   10,
+
+    "entry_bg":         "#0a0a1a",
+    "entry_fg":         "#eeeeee",
+
+    "userlist_bg":      "#16213e",
+    "userlist_card_bg": "#0a0a1a",
+
+    "titlebar_bg":      "#16213e",
+    "titlebar_fg":      "#eeeeee",
+    "titlebar_sep":     "#06ffa5",
+
+    "scrollbar_bg":     "#16213e",
+    "scrollbar_trough": "#0a0a1a",
+
+    "send_btn_bg":      "#00ff88",
+    "send_btn_fg":      "#000000",
+
+    "voice_idle_bg":    "#8338ec",
+    "voice_idle_fg":    "#ffffff",
+    "voice_active_bg":  "#ff006e",
+    "voice_active_fg":  "#ffffff",
+
+    "header_bg":        "#16213e",
+    "header_fg":        "#00ff88",
+
+    "status_fg":        "#06ffa5",
+
+    "system_msg_color": "#f5f5dc",
+
+    "login_bg":         "#1a1a2e",
+    "login_form_bg":    "#16213e",
+    "login_field_bg":   "#0f3460",
+    "login_fg":         "#eeeeee",
+    "login_label_fg":   "#aaaaaa",
+    "login_cursor":     "#00ff88",
+    "login_btn_bg":     "#00ff88",
+    "login_btn_fg":     "#000000",
+    "login_error_bg":   "#3d0000",
+    "login_error_fg":   "#ff4d4d",
+    "login_title_fg":   "#00ff88",
+    "login_sub_fg":     "#888888",
+
+    "gradient_start":   [10, 10, 26],
+    "gradient_end":     [50, 20, 66],
+    "gradient_lines":   "#00ff88"
+}
