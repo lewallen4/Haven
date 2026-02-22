@@ -3,7 +3,6 @@ import ssl
 import threading
 import json
 import sys
-import subprocess
 import tkinter as tk
 from tkinter import simpledialog, messagebox, Menu, ttk
 import pyaudio
@@ -22,26 +21,20 @@ except ImportError:
     TRAY_AVAILABLE = False
     print("pystray/Pillow not installed — system tray disabled. Run: pip install pystray pillow")
 
-# ---------- Configuration ----------
-SERVER_TCP_PORT = 5000
-SERVER_UDP_PORT = 5001
-CONFIG_FILE = 'haven_config.json'
-MAX_TCP_BUFFER = 65536
-# -----------------------------------
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PyInstaller resource path helper
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ---------- PyInstaller resource path helper ----------
 def resource_path(relative_path):
-    """Get absolute path to resource, works for dev and PyInstaller --onefile."""
+    """Get absolute path to resource — works for dev and PyInstaller --onefile."""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath('.'), relative_path)
 
-THEMES_DIR = resource_path('themes')
-ICON_FILE  = os.path.join(THEMES_DIR, 'haven.ico')
-
+# ---------- Configuration ----------
+SERVER_TCP_PORT = 5000
+SERVER_UDP_PORT = 5001
+CONFIG_FILE     = 'haven_config.json'
+THEMES_DIR      = resource_path('themes')
+ICON_FILE       = os.path.join(THEMES_DIR, 'haven.ico')
+MAX_TCP_BUFFER  = 65536
 # -----------------------------------
 
 # Audio settings
@@ -212,9 +205,9 @@ class LoginScreen(tk.Toplevel):
 
         tk.Frame(self, bg=self.t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(self, text="🌐 HAVEN", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
+        tk.Label(self, text="🌐 HAVEN CHAT", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
                  font=('Segoe UI', 22, 'bold')).pack(pady=(25, 5))
-        tk.Label(self, text="Welcome Home", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
+        tk.Label(self, text="Enter connection details", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
                  font=('Segoe UI', 10)).pack(pady=(0, 20))
 
         self.error_var = tk.StringVar(value=error_msg or '')
@@ -463,7 +456,7 @@ class KeybindDialog(tk.Toplevel):
         custom_frame.pack(pady=10)
         tk.Label(custom_frame, text="CUSTOM KEY/BUTTON:", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 9, 'bold')).pack(pady=(0, 10))
-        self.listen_btn = tk.Button(custom_frame, text="Click to Capture",
+        self.listen_btn = tk.Button(custom_frame, text="🎯 Click to Capture",
                                     bg=self.t['accent_3'], fg='#fff',
                                     font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
                                     command=self.start_listening, padx=20, pady=12, cursor='hand2',
@@ -473,7 +466,7 @@ class KeybindDialog(tk.Toplevel):
                                       bg=self.t['glass_bg'], fg=self.t['accent_4'],
                                       font=('Segoe UI', 9, 'italic'))
         self.capture_label.pack(pady=5)
-        tk.Button(self, text="Return", bg=self.t['accent_2'], fg='#fff',
+        tk.Button(self, text="Cancel", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
                   command=self.destroy, padx=20, pady=8, cursor='hand2').pack(pady=15)
         self.kb_listener = None; self.mouse_listener = None
@@ -787,6 +780,15 @@ class HavenClient:
         self._tcp_buffer = ''
         self.tray_icon   = None
 
+        # UI widget refs — populated by build_ui(), cleared on rebuild
+        self.canvas_bg       = None
+        self.chat_text       = None
+        self.msg_entry       = None
+        self.voice_btn       = None
+        self.status_label    = None
+        self.user_list_frame = None
+        self.speaker_labels  = {}
+
         config = self.load_config()
         self.ptt_key    = config.get('ptt_key', 'Control_L')
         self.name_color = config.get('name_color', self.generate_random_color())
@@ -848,7 +850,6 @@ class HavenClient:
         self.stream_out   = None
         self.voice_active = False
         self.active_speakers = set()
-        self.speaker_labels  = {}
 
         # Start system tray BEFORE network threads
         self._start_tray()
@@ -863,37 +864,28 @@ class HavenClient:
     # ── System Tray ──────────────────────────────────────────────
 
     def _start_tray(self):
-        """Spin up the pystray icon in its own daemon thread."""
         if not TRAY_AVAILABLE:
             return
-
         img = load_tray_image()
         if img is None:
             return
-
         menu = pystray.Menu(
             pystray.MenuItem('Haven Chat', self._tray_restore, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Restore', self._tray_restore),
             pystray.MenuItem('Quit',    self._tray_quit),
         )
-
         self.tray_icon = pystray.Icon('haven_chat', img, 'Haven Chat', menu)
-
-        # Run the tray icon in a background thread — it has its own event loop
         tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         tray_thread.start()
 
     def _tray_restore(self, icon=None, item=None):
-        """Called from the tray — must schedule UI work on the tkinter thread."""
         self.root.after(0, self._show_window)
 
     def _tray_quit(self, icon=None, item=None):
-        """Quit from the tray menu."""
         self.root.after(0, self.on_close)
 
     def _show_window(self):
-        """Restore the window from tray/hidden state."""
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -901,21 +893,63 @@ class HavenClient:
         self.root.after(100, lambda: self.root.attributes('-topmost', False))
 
     def minimize_to_tray(self):
-        """Hide the window — tray icon stays visible for restore."""
         self.root.withdraw()
 
     # ── Theme ────────────────────────────────────────────────────
 
     def apply_theme(self, theme_name):
-        """Save the new theme and restart the client process cleanly."""
+        """Switch theme and fully redraw the UI in-place — no process restart."""
         self.theme_name = theme_name
+        self.theme      = load_theme(theme_name)
         self.save_config()
-        if self.tray_icon:
-            try: self.tray_icon.stop()
-            except: pass
-        self.running = False
-        subprocess.Popen([sys.executable] + sys.argv)
-        self.root.destroy()
+        self.rebuild_ui()
+
+    def rebuild_ui(self):
+        """Destroy every widget inside root and rebuild with the current theme."""
+        # Snapshot chat history so we can restore it
+        chat_history_snapshot = None
+        if self.chat_text:
+            try:
+                self.chat_text.config(state=tk.NORMAL)
+                chat_history_snapshot = self.chat_text.get('1.0', tk.END)
+                self.chat_text.config(state=tk.DISABLED)
+            except Exception:
+                pass
+
+        # Destroy all current widgets
+        for widget in self.root.winfo_children():
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+
+        # Reset widget refs
+        self.canvas_bg       = None
+        self.chat_text       = None
+        self.msg_entry       = None
+        self.voice_btn       = None
+        self.status_label    = None
+        self.user_list_frame = None
+        self.speaker_labels  = {}
+
+        # Rebuild everything with the new theme
+        self.root.configure(bg=self.theme['bg_color'])
+        self.build_ui()
+
+        # Restore chat content (plain text — tags lost but content preserved)
+        if chat_history_snapshot and chat_history_snapshot.strip():
+            self.chat_text.config(state=tk.NORMAL)
+            self.chat_text.delete('1.0', tk.END)
+            self.chat_text.insert(tk.END, chat_history_snapshot.rstrip('\n'))
+            self.chat_text.config(state=tk.DISABLED)
+            self.chat_text.see(tk.END)
+
+        # Restore user list from the in-memory colour map
+        self.update_userlist_with_colors(
+            [{'username': u, 'color': c} for u, c in self.user_colors.items()]
+        )
+
+        self.display_system_message(f"✓ Theme changed to {self.theme.get('name', self.theme_name)}")
 
     # ── Login helpers ────────────────────────────────────────────
 
@@ -1119,7 +1153,6 @@ class HavenClient:
         controls_frame = tk.Frame(title_bar, bg=t['titlebar_bg'])
         controls_frame.pack(side=tk.RIGHT, padx=5)
 
-        # Minimize button now hides to tray
         tk.Button(controls_frame, text="─", bg=t['titlebar_bg'], fg=t['titlebar_fg'],
                   font=('Segoe UI', 14), bd=0,
                   activebackground=t['accent_3'], activeforeground=t['fg_color'],
@@ -1207,8 +1240,19 @@ class HavenClient:
         voice_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self.update_voice_button_text()
-        self.voice_btn = tk.Button(voice_inner, text=self.voice_btn_text,
-                                   bg=t['voice_idle_bg'], fg=t['voice_idle_fg'],
+
+        # Reflect current voice state correctly after a rebuild
+        if getattr(self, 'voice_active', False):
+            vbg  = t['voice_active_bg']
+            vfg  = t['voice_active_fg']
+            vtxt = "🔴 TRANSMITTING..."
+        else:
+            vbg  = t['voice_idle_bg']
+            vfg  = t['voice_idle_fg']
+            vtxt = self.voice_btn_text
+
+        self.voice_btn = tk.Button(voice_inner, text=vtxt,
+                                   bg=vbg, fg=vfg,
                                    font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
                                    cursor='hand2', activebackground=t['voice_active_bg'],
                                    bd=0, padx=20, pady=10)
@@ -1262,7 +1306,7 @@ class HavenClient:
     def show_about(self):
         t = self.theme
         messagebox.showinfo("About Haven Chat",
-                            f"Haven Chat v2.2\n\nCurrent theme: {t.get('name', self.theme_name)}\n\n"
+                            f"Haven Chat v2.1\n\nCurrent theme: {t.get('name', self.theme_name)}\n\n"
                             "A hopefully secure voice and text chat client\nwith vibes and dreams.\n\n"
                             "✨ By downloading, installing, or using this Software, you hereby affirm to uphold truth, justice, equity, and the democratic ideals of the American way. You further acknowledge and agree to defend and respect the sovereignty, self-determination, and human rights of all peoples, including but not limited to those of Ukraine, Palestine, Taiwan, Hong Kong, Tibet, Sudan, and any nation or community striving toward freedom and dignity. You strive to uphold the right of every person to live authentically, free from discrimination or harm, regardless of race, creed, sexual orientation, or gender identity and expression. Use of this Software constitutes your pledge to counter oppression, misinformation, and authoritarianism in all forms, and to act in good faith toward a more just, accepting, tolerant and sustainable world. ✨\n\n")
 
@@ -1454,6 +1498,8 @@ class HavenClient:
 
     def display_message(self, user, text, align='left', timestamp=None, color=None):
         t = self.theme
+        if self.chat_text is None:
+            return
         self.chat_text.config(state=tk.NORMAL)
         if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
         if align == 'right':
@@ -1482,6 +1528,8 @@ class HavenClient:
 
     def display_system_message(self, text):
         t = self.theme
+        if self.chat_text is None:
+            return
         self.chat_text.config(state=tk.NORMAL)
         timestamp = datetime.now().strftime('%H:%M')
         self.chat_text.insert(tk.END, f'[{timestamp}] ', 'sys_time')
@@ -1492,6 +1540,8 @@ class HavenClient:
         self.chat_text.see(tk.END)
 
     def update_userlist_with_colors(self, users_with_colors):
+        if self.user_list_frame is None:
+            return
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
         self.speaker_labels.clear()
@@ -1504,6 +1554,8 @@ class HavenClient:
             self.user_colors[self.username] = self.name_color
 
     def add_user_to_list(self, username, color):
+        if self.user_list_frame is None:
+            return
         t = self.theme
         card = tk.Frame(self.user_list_frame, bg=t['userlist_card_bg'],
                         highlightthickness=1, highlightbackground=t['accent_4'])
@@ -1618,8 +1670,9 @@ class HavenClient:
     def start_voice(self, event=None):
         if self.voice_active or not self.authenticated: return
         self.voice_active = True
-        self.voice_btn.config(bg=self.theme['voice_active_bg'], fg=self.theme['voice_active_fg'],
-                              text="🔴 TRANSMITTING...")
+        if self.voice_btn:
+            self.voice_btn.config(bg=self.theme['voice_active_bg'], fg=self.theme['voice_active_fg'],
+                                  text="🔴 TRANSMITTING...")
         try: self.tcp_sock.send((json.dumps({'type': 'voice_start'}) + '\n').encode())
         except: pass
         if self.stream_in is None:
@@ -1637,16 +1690,18 @@ class HavenClient:
             except Exception as e:
                 messagebox.showerror("Audio Error", f"Failed to open microphone: {str(e)}")
                 self.voice_active = False
-                self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
-                                      text=self.voice_btn_text)
+                if self.voice_btn:
+                    self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
+                                          text=self.voice_btn_text)
                 return
         threading.Thread(target=self.send_audio, daemon=True).start()
 
     def stop_voice(self, event=None):
         if not self.voice_active: return
         self.voice_active = False
-        self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
-                              text=self.voice_btn_text)
+        if self.voice_btn:
+            self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
+                                  text=self.voice_btn_text)
         try: self.tcp_sock.send((json.dumps({'type': 'voice_stop'}) + '\n').encode())
         except: pass
 
@@ -1671,7 +1726,6 @@ class HavenClient:
         self._closing = True
         self.running  = False
 
-        # Stop the tray icon first so it doesn't linger
         if self.tray_icon:
             try: self.tray_icon.stop()
             except: pass
