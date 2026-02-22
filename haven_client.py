@@ -1,4 +1,5 @@
 import socket
+import ssl
 import threading
 import json
 import tkinter as tk
@@ -15,6 +16,7 @@ SERVER_TCP_PORT = 5000
 SERVER_UDP_PORT = 5001
 CONFIG_FILE = 'haven_config.json'
 THEMES_DIR  = 'themes'
+MAX_TCP_BUFFER = 65536   # 64KB — matches server-side cap
 # -----------------------------------
 
 # Audio settings
@@ -36,11 +38,45 @@ USER_COLOR_PALETTE = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TLS helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_tls_context():
+    """
+    Create a TLS client context.
+    Since we're using a self-signed server cert, we disable hostname verification
+    and cert validation — this still encrypts traffic and defeats passive sniffing.
+    If you get a real cert (e.g. Let's Encrypt), remove the two lines below and
+    instead set ctx.load_verify_locations('server.crt') for pinning.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Challenge-response auth helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_password_hash(password):
+    """SHA256 of the password — this is stored server-side."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def compute_auth_response(nonce, password_hash):
+    """
+    One-time challenge response: SHA256(nonce + ":" + password_hash).
+    The nonce is unique per connection, so even if traffic were captured,
+    replaying the response won't work.
+    """
+    return hashlib.sha256(f"{nonce}:{password_hash}".encode()).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Theme loader
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_theme(theme_name='default'):
-    """Load a theme JSON file from the themes directory. Falls back to default."""
     path = os.path.join(THEMES_DIR, f'{theme_name}.json')
     if not os.path.exists(path):
         path = os.path.join(THEMES_DIR, 'default.json')
@@ -52,7 +88,6 @@ def load_theme(theme_name='default'):
         return _fallback_theme()
 
 def list_themes():
-    """Return list of available theme names (without .json extension)."""
     if not os.path.exists(THEMES_DIR):
         return ['default']
     names = []
@@ -62,7 +97,6 @@ def list_themes():
     return names if names else ['default']
 
 def _fallback_theme():
-    """Minimal built-in theme so the app never crashes on missing files."""
     return {
         "name": "Fallback",
         "bg_color": "#0a0a1a", "glass_bg": "#1a1a2e", "glass_accent": "#16213e",
@@ -95,7 +129,7 @@ class LoginScreen(tk.Toplevel):
     def __init__(self, parent, theme, prefill=None, error_msg=None):
         super().__init__(parent)
         self.result = None
-        self.t = theme  # shorthand
+        self.t = theme
 
         self.title("Haven Chat – Connect")
         self.configure(bg=self.t['login_bg'])
@@ -236,12 +270,10 @@ class ThemeDialog(tk.Toplevel):
                  font=('Segoe UI', 14, 'bold')).pack(pady=20)
 
         themes = list_themes()
-
         list_frame = tk.Frame(self, bg=self.t['glass_bg'])
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20)
 
         for theme_name in themes:
-            # Load the theme to get its display name and description
             try:
                 t_data = load_theme(theme_name)
                 display = t_data.get('name', theme_name.title())
@@ -251,7 +283,6 @@ class ThemeDialog(tk.Toplevel):
                 desc    = ''
 
             is_current = (theme_name == current_theme_name)
-
             card = tk.Frame(list_frame, bg=self.t['glass_accent'],
                             highlightthickness=2,
                             highlightbackground=self.t['accent_1'] if is_current else self.t['glass_accent'])
@@ -548,7 +579,6 @@ class AudioDeviceDialog(tk.Toplevel):
                                                         callback())).pack(fill=tk.X, padx=10, pady=(0, 15))
             return lbl
 
-        # Input
         in_frame = section("INPUT DEVICE (Microphone)")
         self.input_var = tk.StringVar(value=self.result.get('input_device') or
                                       (self.input_devices[0] if self.input_devices else "Default"))
@@ -564,7 +594,6 @@ class AudioDeviceDialog(tk.Toplevel):
                   command=self.test_input_device, padx=15, pady=5,
                   cursor='hand2').pack(pady=(0, 15))
 
-        # Output
         out_frame = section("OUTPUT DEVICE (Speakers/Headphones)")
         self.output_var = tk.StringVar(value=self.result.get('output_device') or
                                        (self.output_devices[0] if self.output_devices else "Default"))
@@ -580,7 +609,6 @@ class AudioDeviceDialog(tk.Toplevel):
                   command=self.test_output_device, padx=15, pady=5,
                   cursor='hand2').pack(pady=(0, 15))
 
-        # Sample rate info
         rate_frame = tk.Frame(self, bg=self.t['glass_accent'])
         rate_frame.pack(fill=tk.X, padx=20, pady=10)
         tk.Label(rate_frame, text="SUPPORTED SAMPLE RATES", bg=self.t['glass_accent'],
@@ -776,7 +804,6 @@ class HavenClient:
         self.server_assigned_color = None
         self._tcp_buffer = ''
 
-        # Load config
         config = self.load_config()
         self.ptt_key      = config.get('ptt_key', 'Control_L')
         self.name_color   = config.get('name_color', self.generate_random_color())
@@ -795,7 +822,6 @@ class HavenClient:
         self.current_input_rate  = DEFAULT_RATE
         self.current_output_rate = DEFAULT_RATE
 
-        # Connection / auth loop
         server_ip      = config.get('server_ip', '')
         saved_username = config.get('username', '')
         saved_password = config.get('password', '')
@@ -822,7 +848,6 @@ class HavenClient:
             self.root.destroy()
             return
 
-        # Build main UI
         self.root.deiconify()
         self.root.title("Haven Chat")
         self.root.geometry("900x850")
@@ -836,7 +861,6 @@ class HavenClient:
 
         self.build_ui()
 
-        # Audio
         self.p            = pyaudio.PyAudio()
         self.stream_in    = None
         self.stream_out   = None
@@ -845,7 +869,6 @@ class HavenClient:
         self.active_speakers = set()
         self.speaker_labels  = {}
 
-        # Start network threads now that UI exists
         threading.Thread(target=self.receive_tcp, daemon=True).start()
         threading.Thread(target=self.receive_udp, daemon=True).start()
 
@@ -856,12 +879,10 @@ class HavenClient:
     # ── Theme ────────────────────────────────────────────────────
 
     def apply_theme(self, theme_name):
-        """Switch to a new theme and rebuild the UI."""
         self.theme_name = theme_name
         self.theme      = load_theme(theme_name)
         self.save_config()
 
-        # Rebuild the UI in place
         for widget in self.root.winfo_children():
             widget.destroy()
 
@@ -871,7 +892,6 @@ class HavenClient:
 
         self.build_ui()
 
-        # Re-populate user list
         users_with_colors = [{'username': u, 'color': c} for u, c in self.user_colors.items()]
         self.update_userlist_with_colors(users_with_colors)
 
@@ -921,28 +941,34 @@ class HavenClient:
                                    'username': data['username'], 'password': ''}
 
     def _attempt_connect(self, server_ip, username, password):
+        """
+        Updated auth flow to match the hardened server:
+          1. Open a TLS-wrapped TCP connection
+          2. Receive the server's challenge nonce
+          3. Compute challenge response: SHA256(nonce + ":" + SHA256(password))
+          4. Send login message with auth_response instead of raw password_hash
+        """
         try:
-            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp_sock.settimeout(5)
-            tcp_sock.connect((server_ip, SERVER_TCP_PORT))
+            tls_ctx = create_tls_context()
+
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.settimeout(10)
+            raw_sock.connect((server_ip, SERVER_TCP_PORT))
+            tcp_sock = tls_ctx.wrap_socket(raw_sock, server_hostname=server_ip)
 
             udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_sock.bind(('0.0.0.0', 0))
             udp_port = udp_sock.getsockname()[1]
 
-            password_hash = hashlib.sha256(password.encode()).hexdigest()
-            tcp_sock.send((json.dumps({
-                'type': 'login', 'username': username,
-                'udp_port': udp_port, 'password_hash': password_hash,
-                'user_color': self.name_color
-            }) + '\n').encode())
+            password_hash = compute_password_hash(password)
 
-            tcp_sock.settimeout(8)
+            # Wait for challenge from server
             buffer = ''
-            while True:
-                chunk = tcp_sock.recv(4096).decode()
+            nonce = None
+            while nonce is None:
+                chunk = tcp_sock.recv(4096).decode('utf-8', errors='replace')
                 if not chunk:
-                    raise ConnectionError("Server closed connection")
+                    raise ConnectionError("Server closed connection before challenge")
                 buffer += chunk
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
@@ -951,7 +977,43 @@ class HavenClient:
                         continue
                     try:
                         msg = json.loads(line)
-                    except:
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get('type') == 'challenge':
+                        nonce = msg['nonce']
+                        break
+                    elif msg.get('type') == 'error':
+                        raise ConnectionError(msg.get('message', 'Server error'))
+
+            if not nonce:
+                raise ConnectionError("Did not receive challenge from server")
+
+            # Compute and send challenge response
+            auth_response = compute_auth_response(nonce, password_hash)
+            login_msg = json.dumps({
+                'type': 'login',
+                'username': username,
+                'udp_port': udp_port,
+                'auth_response': auth_response,
+                'user_color': self.name_color
+            }) + '\n'
+            tcp_sock.send(login_msg.encode())
+
+            # Wait for auth result
+            tcp_sock.settimeout(10)
+            while True:
+                chunk = tcp_sock.recv(4096).decode('utf-8', errors='replace')
+                if not chunk:
+                    raise ConnectionError("Server closed connection during auth")
+                buffer += chunk
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
                         continue
 
                     if msg['type'] == 'auth_ok':
@@ -964,7 +1026,7 @@ class HavenClient:
                         self.password      = password
                         self.running       = True
                         self.authenticated = True
-                        self._tcp_buffer   = buffer
+                        self._tcp_buffer   = buffer  # pass leftover buffer to receive_tcp
                         if 'user_color' in msg:
                             self.server_assigned_color = msg['user_color']
                             self.name_color = msg['user_color']
@@ -975,6 +1037,13 @@ class HavenClient:
                         udp_sock.close()
                         return 'auth_failed'
 
+                    elif msg['type'] == 'error':
+                        tcp_sock.close()
+                        udp_sock.close()
+                        return msg.get('message', 'Server error')
+
+        except ssl.SSLError as e:
+            return f'TLS error: {e}'
         except socket.timeout:
             return 'Connection timed out'
         except ConnectionRefusedError:
@@ -1030,13 +1099,12 @@ class HavenClient:
     # ── GUI ──────────────────────────────────────────────────────
 
     def build_ui(self):
-        t = self.theme  # shorthand
+        t = self.theme
 
         self.canvas_bg = tk.Canvas(self.root, bg=t['bg_color'], highlightthickness=0)
         self.canvas_bg.place(x=0, y=0, relwidth=1, relheight=1)
         self.draw_background()
 
-        # Title bar
         title_bar = tk.Frame(self.root, bg=t['titlebar_bg'], height=35)
         title_bar.pack(fill=tk.X, side=tk.TOP)
         title_bar.pack_propagate(False)
@@ -1104,9 +1172,9 @@ class HavenClient:
                 self.root.geometry(f"+{self.root.winfo_x()+dx}+{self.root.winfo_y()+dy}")
 
         for w in (title_bar, app_title, app_icon):
-            w.bind('<Button-1>',      start_move)
+            w.bind('<Button-1>',        start_move)
             w.bind('<ButtonRelease-1>', stop_move)
-            w.bind('<B1-Motion>',     do_move)
+            w.bind('<B1-Motion>',       do_move)
 
         tk.Frame(self.root, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
 
@@ -1114,7 +1182,6 @@ class HavenClient:
                               highlightbackground=t['accent_4'])
         main_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
 
-        # Header
         header = tk.Frame(main_frame, bg=t['header_bg'], height=60)
         header.pack(fill=tk.X, padx=2, pady=2)
         header.pack_propagate(False)
@@ -1127,11 +1194,9 @@ class HavenClient:
                                      font=('Segoe UI', 10))
         self.status_label.pack(side=tk.RIGHT, padx=20)
 
-        # Content
         content = tk.Frame(main_frame, bg=t['glass_bg'])
         content.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
 
-        # Left — chat area
         left_frame = tk.Frame(content, bg=t['glass_bg'])
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -1151,7 +1216,6 @@ class HavenClient:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.config(yscrollcommand=scrollbar.set)
 
-        # Message entry
         entry_container = tk.Frame(left_frame, bg=t['glass_accent'], height=50)
         entry_container.pack(fill=tk.X)
         entry_container.pack_propagate(False)
@@ -1171,7 +1235,6 @@ class HavenClient:
                   cursor='hand2', activebackground=t['accent_4'],
                   command=self.send_chat, padx=20, pady=8).pack(side=tk.RIGHT)
 
-        # Voice button
         voice_container = tk.Frame(left_frame, bg=t['glass_accent'], height=60)
         voice_container.pack(fill=tk.X, pady=(10, 0))
         voice_container.pack_propagate(False)
@@ -1189,7 +1252,6 @@ class HavenClient:
         self.voice_btn.bind('<ButtonPress>',   self.start_voice)
         self.voice_btn.bind('<ButtonRelease>', self.stop_voice)
 
-        # Right — user list
         right_frame = tk.Frame(content, bg=t['userlist_bg'], width=200)
         right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 10), pady=10)
         right_frame.pack_propagate(False)
@@ -1237,20 +1299,11 @@ class HavenClient:
                                        width=1, dash=(10, 20), stipple='gray50')
 
     def minimize_window(self):
-        """
-        Minimize a borderless (overrideredirect) window.
-        We must temporarily lift the override-redirect flag, call iconify(),
-        then restore override-redirect once the window is deiconified.
-        """
-        # Remember current position so we can restore it
         x = self.root.winfo_x()
         y = self.root.winfo_y()
-
-        # Temporarily disable override-redirect so the WM can iconify it
         self.root.overrideredirect(False)
         self.root.iconify()
 
-        # When the window is restored, re-apply override-redirect and reposition
         def on_deiconify(event=None):
             self.root.overrideredirect(True)
             self.root.geometry(f'+{x}+{y}')
@@ -1354,21 +1407,30 @@ class HavenClient:
         self._tcp_buffer = ''
 
         while self.running:
+            # Process any complete messages already in buffer
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 if not line.strip():
                     continue
                 try:
                     msg = json.loads(line)
-                except:
+                except json.JSONDecodeError:
                     continue
-                self.handle_tcp_message(msg)
+                self.root.after(0, lambda m=msg: self.handle_tcp_message(m))
 
             try:
-                data = self.tcp_sock.recv(4096).decode()
+                data = self.tcp_sock.recv(4096).decode('utf-8', errors='replace')
                 if not data:
                     break
                 buffer += data
+
+                # Prevent memory exhaustion from a malicious/broken server
+                if len(buffer) > MAX_TCP_BUFFER:
+                    print("TCP buffer overflow — disconnecting")
+                    break
+
+            except ssl.SSLError:
+                break
             except OSError:
                 break
             except Exception:
@@ -1462,7 +1524,7 @@ class HavenClient:
     def receive_udp(self):
         while self.running:
             try:
-                data, addr = self.udp_sock.recvfrom(2048)
+                data, addr = self.udp_sock.recvfrom(4096)
                 if self.stream_out is None:
                     try:
                         device_index = self.audio_settings.get('output_device_index', None)
