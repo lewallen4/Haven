@@ -2,6 +2,8 @@ import socket
 import ssl
 import threading
 import json
+import sys
+import subprocess
 import tkinter as tk
 from tkinter import simpledialog, messagebox, Menu, ttk
 import pyaudio
@@ -11,12 +13,22 @@ import hashlib
 import random
 from pynput import keyboard, mouse
 
+# Tray icon support — requires: pip install pystray pillow
+try:
+    import pystray
+    from PIL import Image
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    print("pystray/Pillow not installed — system tray disabled. Run: pip install pystray pillow")
+
 # ---------- Configuration ----------
 SERVER_TCP_PORT = 5000
 SERVER_UDP_PORT = 5001
 CONFIG_FILE = 'haven_config.json'
 THEMES_DIR  = 'themes'
-MAX_TCP_BUFFER = 65536   # 64KB — matches server-side cap
+ICON_FILE   = os.path.join(THEMES_DIR, 'haven.ico')
+MAX_TCP_BUFFER = 65536
 # -----------------------------------
 
 # Audio settings
@@ -26,7 +38,6 @@ CHANNELS = 1
 SUPPORTED_RATES = [44100, 48000, 32000, 24000, 16000, 8000]
 DEFAULT_RATE = 44100
 
-# Vibrant color palette for usernames (same as server)
 USER_COLOR_PALETTE = [
     '#ff006e', '#ff4d6d', '#ff6b9d', '#ff8fab',
     '#00ff88', '#06ffa5', '#4ecca3', '#78e08f',
@@ -42,13 +53,6 @@ USER_COLOR_PALETTE = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def create_tls_context():
-    """
-    Create a TLS client context.
-    Since we're using a self-signed server cert, we disable hostname verification
-    and cert validation — this still encrypts traffic and defeats passive sniffing.
-    If you get a real cert (e.g. Let's Encrypt), remove the two lines below and
-    instead set ctx.load_verify_locations('server.crt') for pinning.
-    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -56,20 +60,42 @@ def create_tls_context():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Challenge-response auth helper
+# Challenge-response auth helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_password_hash(password):
-    """SHA256 of the password — this is stored server-side."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def compute_auth_response(nonce, password_hash):
-    """
-    One-time challenge response: SHA256(nonce + ":" + password_hash).
-    The nonce is unique per connection, so even if traffic were captured,
-    replaying the response won't work.
-    """
     return hashlib.sha256(f"{nonce}:{password_hash}".encode()).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tray icon helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_tray_image():
+    """
+    Load haven.ico from the themes folder as a PIL Image for pystray.
+    Falls back to a simple generated icon if the file is missing.
+    """
+    if TRAY_AVAILABLE:
+        if os.path.exists(ICON_FILE):
+            try:
+                return Image.open(ICON_FILE).convert('RGBA')
+            except Exception as e:
+                print(f"Could not load tray icon from file: {e}")
+        # Fallback: generate a simple coloured circle
+        img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+        try:
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([4, 4, 60, 60], fill='#00ff88', outline='#06ffa5', width=3)
+            draw.ellipse([20, 20, 44, 44], fill='#0a0a1a')
+        except Exception:
+            pass
+        return img
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -130,24 +156,51 @@ class LoginScreen(tk.Toplevel):
         super().__init__(parent)
         self.result = None
         self.t = theme
+        self._drag_x = None
+        self._drag_y = None
 
         self.title("Haven Chat – Connect")
         self.configure(bg=self.t['login_bg'])
         self.resizable(False, False)
-        self.geometry("420x520")
+        self.overrideredirect(True)
+        self.geometry("420x560")
 
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 210
-        y = (self.winfo_screenheight() // 2) - 260
-        self.geometry(f'420x520+{x}+{y}')
+        y = (self.winfo_screenheight() // 2) - 280
+        self.geometry(f'420x560+{x}+{y}')
 
-        self.transient(parent)
         self.grab_set()
         self.lift()
         self.focus_force()
 
+        # Custom title bar matching main window style
+        title_bar = tk.Frame(self, bg=self.t['titlebar_bg'], height=35)
+        title_bar.pack(fill=tk.X, side=tk.TOP)
+        title_bar.pack_propagate(False)
+
+        close_btn = tk.Button(title_bar, text="✕",
+                              bg=self.t['titlebar_bg'], fg=self.t['titlebar_fg'],
+                              font=('Segoe UI', 14), bd=0,
+                              activebackground=self.t['accent_2'], activeforeground='#fff',
+                              command=self._cancel, cursor='hand2', padx=8, pady=0)
+        close_btn.pack(side=tk.RIGHT, padx=5)
+
+        def start_move(event): self._drag_x = event.x; self._drag_y = event.y
+        def stop_move(event):  self._drag_x = None;    self._drag_y = None
+        def do_move(event):
+            if self._drag_x is not None:
+                dx = event.x - self._drag_x; dy = event.y - self._drag_y
+                self.geometry(f"+{self.winfo_x()+dx}+{self.winfo_y()+dy}")
+
+        title_bar.bind('<Button-1>',        start_move)
+        title_bar.bind('<ButtonRelease-1>', stop_move)
+        title_bar.bind('<B1-Motion>',       do_move)
+
+        tk.Frame(self, bg=self.t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
+
         tk.Label(self, text="🌐 HAVEN CHAT", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
-                 font=('Segoe UI', 22, 'bold')).pack(pady=(30, 5))
+                 font=('Segoe UI', 22, 'bold')).pack(pady=(25, 5))
         tk.Label(self, text="Enter connection details", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
                  font=('Segoe UI', 10)).pack(pady=(0, 20))
 
@@ -195,8 +248,7 @@ class LoginScreen(tk.Toplevel):
                                      bg=self.t['login_btn_bg'], fg=self.t['login_btn_fg'],
                                      font=('Segoe UI', 13, 'bold'), relief=tk.FLAT,
                                      command=self._submit, padx=20, pady=12,
-                                     cursor='hand2',
-                                     activebackground=self.t['accent_1'])
+                                     cursor='hand2', activebackground=self.t['accent_1'])
         self.connect_btn.pack(pady=20, padx=30, fill=tk.X)
 
         self.password_entry.bind('<Return>', lambda e: self._submit())
@@ -204,12 +256,16 @@ class LoginScreen(tk.Toplevel):
         self.username_entry.bind('<Return>', lambda e: self.password_entry.focus())
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
-        if not self.ip_entry.get():
-            self.ip_entry.focus()
-        elif not self.username_entry.get():
-            self.username_entry.focus()
-        else:
-            self.password_entry.focus()
+        def _set_focus():
+            self.focus_force()
+            if not self.ip_entry.get():
+                self.ip_entry.focus_set()
+            elif not self.username_entry.get():
+                self.username_entry.focus_set()
+            else:
+                self.password_entry.focus_set()
+
+        self.after(100, _set_focus)
 
     def show_error(self, msg):
         self.error_var.set(msg)
@@ -220,20 +276,14 @@ class LoginScreen(tk.Toplevel):
         ip       = self.ip_entry.get().strip()
         username = self.username_entry.get().strip()
         password = self.password_entry.get()
-
         if not ip:
-            self.show_error("⚠  Please enter a server IP address.")
-            return
+            self.show_error("⚠  Please enter a server IP address."); return
         if not username:
-            self.show_error("⚠  Please enter a username.")
-            return
+            self.show_error("⚠  Please enter a username."); return
         if not password:
-            self.show_error("⚠  Please enter a password.")
-            return
-
+            self.show_error("⚠  Please enter a password."); return
         self.connect_btn.config(state=tk.DISABLED, text="Connecting…")
         self.update_idletasks()
-
         self.result = {'server_ip': ip, 'username': username,
                        'password': password, 'remember': self.remember_var.get()}
         self.destroy()
@@ -252,59 +302,77 @@ class ThemeDialog(tk.Toplevel):
         super().__init__(parent)
         self.result = None
         self.t = theme
-
         self.title("Choose Theme")
         self.configure(bg=self.t['glass_bg'])
-        self.resizable(False, False)
-
+        self.resizable(False, True)
         self.update_idletasks()
-        self.geometry("320x400")
-        x = (self.winfo_screenwidth() // 2) - 160
-        y = (self.winfo_screenheight() // 2) - 200
-        self.geometry(f'320x400+{x}+{y}')
-
+        self.geometry("340x500")
+        x = (self.winfo_screenwidth() // 2) - 170
+        y = (self.winfo_screenheight() // 2) - 250
+        self.geometry(f'340x500+{x}+{y}')
         self.transient(parent)
         self.grab_set()
 
         tk.Label(self, text="Choose Theme", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=20)
 
-        themes = list_themes()
-        list_frame = tk.Frame(self, bg=self.t['glass_bg'])
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20)
+        # Scrollable container
+        outer = tk.Frame(self, bg=self.t['glass_bg'])
+        outer.pack(fill=tk.BOTH, expand=True, padx=20)
 
+        canvas = tk.Canvas(outer, bg=self.t['glass_bg'], highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview,
+                                 bg=self.t['scrollbar_bg'],
+                                 troughcolor=self.t['scrollbar_trough'],
+                                 activebackground=self.t['accent_1'])
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        list_frame = tk.Frame(canvas, bg=self.t['glass_bg'])
+        canvas_window = canvas.create_window((0, 0), window=list_frame, anchor='nw')
+
+        def on_frame_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def on_canvas_configure(e):
+            canvas.itemconfig(canvas_window, width=e.width)
+        def on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        list_frame.bind('<Configure>', on_frame_configure)
+        canvas.bind('<Configure>', on_canvas_configure)
+        canvas.bind('<MouseWheel>', on_mousewheel)
+        list_frame.bind('<MouseWheel>', on_mousewheel)
+
+        themes = list_themes()
         for theme_name in themes:
             try:
-                t_data = load_theme(theme_name)
+                t_data  = load_theme(theme_name)
                 display = t_data.get('name', theme_name.title())
                 desc    = t_data.get('description', '')
             except:
-                display = theme_name.title()
-                desc    = ''
+                display = theme_name.title(); desc = ''
 
             is_current = (theme_name == current_theme_name)
-            card = tk.Frame(list_frame, bg=self.t['glass_accent'],
-                            highlightthickness=2,
+            card = tk.Frame(list_frame, bg=self.t['glass_accent'], highlightthickness=2,
                             highlightbackground=self.t['accent_1'] if is_current else self.t['glass_accent'])
             card.pack(fill=tk.X, pady=6)
-
             inner = tk.Frame(card, bg=self.t['glass_accent'])
             inner.pack(fill=tk.X, padx=12, pady=10)
-
             name_label = tk.Label(inner, text=display + (' ✓' if is_current else ''),
                                   bg=self.t['glass_accent'],
                                   fg=self.t['accent_1'] if is_current else self.t['fg_color'],
                                   font=('Segoe UI', 11, 'bold'), anchor='w')
             name_label.pack(anchor='w')
-
             if desc:
-                tk.Label(inner, text=desc, bg=self.t['glass_accent'],
-                         fg=self.t['accent_4'], font=('Segoe UI', 8),
-                         anchor='w', wraplength=250).pack(anchor='w')
-
-            card.bind('<Button-1>', lambda e, n=theme_name: self._select(n))
-            inner.bind('<Button-1>', lambda e, n=theme_name: self._select(n))
-            name_label.bind('<Button-1>', lambda e, n=theme_name: self._select(n))
+                desc_label = tk.Label(inner, text=desc, bg=self.t['glass_accent'], fg=self.t['accent_4'],
+                         font=('Segoe UI', 8), anchor='w', wraplength=260)
+                desc_label.pack(anchor='w')
+                desc_label.bind('<MouseWheel>', on_mousewheel)
+            for w in (card, inner, name_label):
+                w.bind('<Button-1>', lambda e, n=theme_name: self._select(n))
+                w.bind('<MouseWheel>', on_mousewheel)
             card.configure(cursor='hand2')
 
         tk.Button(self, text="Cancel", bg=self.t['accent_2'], fg='#fff',
@@ -322,10 +390,8 @@ class ThemeDialog(tk.Toplevel):
 
 class ModernDialog(simpledialog.Dialog):
     def __init__(self, parent, title, prompt, theme=None, show='', default=''):
-        self.prompt = prompt
-        self.show = show
-        self.default_value = default
-        self.result = None
+        self.prompt = prompt; self.show = show
+        self.default_value = default; self.result = None
         self.t = theme or _fallback_theme()
         super().__init__(parent, title)
 
@@ -337,8 +403,7 @@ class ModernDialog(simpledialog.Dialog):
                               insertbackground=self.t['accent_1'], font=('Segoe UI', 11),
                               show=self.show, relief=tk.FLAT, bd=0)
         self.entry.grid(row=1, padx=20, pady=(0, 10))
-        self.entry.configure(highlightthickness=2,
-                             highlightbackground=self.t['glass_accent'],
+        self.entry.configure(highlightthickness=2, highlightbackground=self.t['glass_accent'],
                              highlightcolor=self.t['accent_1'])
         if self.default_value:
             self.entry.insert(0, self.default_value)
@@ -351,39 +416,28 @@ class ModernDialog(simpledialog.Dialog):
 class KeybindDialog(tk.Toplevel):
     def __init__(self, parent, current_key, theme=None):
         super().__init__(parent)
-        self.result = current_key
-        self.listening = False
-        self.captured_key = None
-        self.t = theme or _fallback_theme()
-
+        self.result = current_key; self.listening = False
+        self.captured_key = None; self.t = theme or _fallback_theme()
         self.title("Set Push-to-Talk Key")
         self.configure(bg=self.t['glass_bg'])
-        self.resizable(True, True)
-        self.geometry("450x550")
-
+        self.resizable(True, True); self.geometry("450x550")
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 225
         y = (self.winfo_screenheight() // 2) - 275
         self.geometry(f'450x550+{x}+{y}')
-
-        self.transient(parent)
-        self.grab_set()
+        self.transient(parent); self.grab_set()
 
         tk.Label(self, text="Choose Push-to-Talk Key", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=20)
         tk.Label(self, text=f"Current: {self.format_key_display(current_key)}",
-                 bg=self.t['glass_bg'], fg=self.t['fg_color'],
-                 font=('Segoe UI', 10)).pack(pady=5)
+                 bg=self.t['glass_bg'], fg=self.t['fg_color'], font=('Segoe UI', 10)).pack(pady=5)
 
         preset_frame = tk.Frame(self, bg=self.t['glass_bg'])
         preset_frame.pack(pady=15)
-
         tk.Label(preset_frame, text="PRESETS:", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, columnspan=2, pady=(0, 10))
-
-        for i, (key, label) in enumerate(zip(
-                ['Control_L', 'Alt_L', 'Shift_L', 'space'],
-                ['Ctrl', 'Alt', 'Shift', 'Space'])):
+        for i, (key, label) in enumerate(zip(['Control_L', 'Alt_L', 'Shift_L', 'space'],
+                                              ['Ctrl', 'Alt', 'Shift', 'Space'])):
             tk.Button(preset_frame, text=label, bg=self.t['glass_accent'], fg=self.t['fg_color'],
                       font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
                       command=lambda k=key: self.select_key(k),
@@ -392,32 +446,24 @@ class KeybindDialog(tk.Toplevel):
                       activeforeground='#000').grid(row=1 + i // 2, column=i % 2, padx=10, pady=5)
 
         tk.Frame(self, bg=self.t['glass_accent'], height=2).pack(fill=tk.X, padx=30, pady=20)
-
         custom_frame = tk.Frame(self, bg=self.t['glass_bg'])
         custom_frame.pack(pady=10)
-
         tk.Label(custom_frame, text="CUSTOM KEY/BUTTON:", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 9, 'bold')).pack(pady=(0, 10))
-
         self.listen_btn = tk.Button(custom_frame, text="🎯 Click to Capture",
                                     bg=self.t['accent_3'], fg='#fff',
                                     font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
-                                    command=self.start_listening,
-                                    padx=20, pady=12, cursor='hand2',
+                                    command=self.start_listening, padx=20, pady=12, cursor='hand2',
                                     activebackground=self.t['accent_2'])
         self.listen_btn.pack()
-
         self.capture_label = tk.Label(custom_frame, text="Press any key or mouse button...",
                                       bg=self.t['glass_bg'], fg=self.t['accent_4'],
                                       font=('Segoe UI', 9, 'italic'))
         self.capture_label.pack(pady=5)
-
         tk.Button(self, text="Cancel", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
                   command=self.destroy, padx=20, pady=8, cursor='hand2').pack(pady=15)
-
-        self.kb_listener = None
-        self.mouse_listener = None
+        self.kb_listener = None; self.mouse_listener = None
 
     def format_key_display(self, key):
         if key.startswith('mouse_'):
@@ -428,13 +474,10 @@ class KeybindDialog(tk.Toplevel):
                 'Shift_L': 'Shift', 'space': 'Space'}.get(key, key)
 
     def select_key(self, key):
-        self.result = key
-        self.cleanup_listeners()
-        self.destroy()
+        self.result = key; self.cleanup_listeners(); self.destroy()
 
     def start_listening(self):
-        if self.listening:
-            return
+        if self.listening: return
         self.listening = True
         self.listen_btn.config(text="⏺ LISTENING...", bg=self.t['accent_2'])
         self.capture_label.config(fg=self.t['accent_1'])
@@ -444,60 +487,42 @@ class KeybindDialog(tk.Toplevel):
         self.mouse_listener.start()
 
     def on_key_press(self, key):
-        if not self.listening:
-            return
+        if not self.listening: return
         try:
             key_str = key.char if (hasattr(key, 'char') and key.char) else str(key)
-            self.captured_key = key_str
-            self.finish_capture()
-        except:
-            pass
+            self.captured_key = key_str; self.finish_capture()
+        except: pass
 
     def on_mouse_click(self, x, y, button, pressed):
-        if not self.listening or not pressed:
-            return
-        self.captured_key = f'mouse_{str(button).replace("Button.", "")}'
-        self.finish_capture()
+        if not self.listening or not pressed: return
+        self.captured_key = f'mouse_{str(button).replace("Button.", "")}'; self.finish_capture()
 
     def finish_capture(self):
-        self.listening = False
-        self.cleanup_listeners()
+        self.listening = False; self.cleanup_listeners()
         if self.captured_key:
             self.result = self.captured_key
             self.listen_btn.config(text=f"✓ {self.format_key_display(self.captured_key)}",
                                    bg=self.t['accent_1'], fg='#000')
-            self.capture_label.config(text="Key captured! Close to apply.",
-                                      fg=self.t['accent_1'])
+            self.capture_label.config(text="Key captured! Close to apply.", fg=self.t['accent_1'])
             self.after(1500, self.destroy)
 
     def cleanup_listeners(self):
-        if self.kb_listener:
-            self.kb_listener.stop()
-            self.kb_listener = None
-        if self.mouse_listener:
-            self.mouse_listener.stop()
-            self.mouse_listener = None
+        if self.kb_listener: self.kb_listener.stop(); self.kb_listener = None
+        if self.mouse_listener: self.mouse_listener.stop(); self.mouse_listener = None
 
     def destroy(self):
-        self.cleanup_listeners()
-        super().destroy()
+        self.cleanup_listeners(); super().destroy()
 
 
 class ColorPickerDialog(tk.Toplevel):
     def __init__(self, parent, current_color, theme=None):
         super().__init__(parent)
-        self.result = current_color
-        self.t = theme or _fallback_theme()
-
+        self.result = current_color; self.t = theme or _fallback_theme()
         self.title("Choose Username Color")
         self.configure(bg=self.t['glass_bg'])
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-
+        self.resizable(False, False); self.transient(parent); self.grab_set()
         tk.Label(self, text="Choose Your Name Color", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=20)
-
         colors = [
             ['#ff006e', '#ff4d6d', '#ff6b9d', '#ff8fab'],
             ['#00ff88', '#06ffa5', '#4ecca3', '#78e08f'],
@@ -506,10 +531,8 @@ class ColorPickerDialog(tk.Toplevel):
             ['#06d6a0', '#00b4d8', '#0096c7', '#48cae4'],
             ['#f72585', '#b5179e', '#7209b7', '#560bad']
         ]
-
         color_frame = tk.Frame(self, bg=self.t['glass_bg'])
         color_frame.pack(pady=20, padx=30)
-
         for row_idx, row in enumerate(colors):
             for col_idx, color in enumerate(row):
                 btn = tk.Button(color_frame, bg=color, width=4, height=2,
@@ -519,41 +542,31 @@ class ColorPickerDialog(tk.Toplevel):
                 if color == current_color:
                     btn.config(relief=tk.RAISED, bd=3)
                 btn.grid(row=row_idx, column=col_idx, padx=5, pady=5)
-
         tk.Button(self, text="Cancel", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
                   command=self.destroy, padx=20, pady=8, cursor='hand2').pack(pady=15)
 
     def select_color(self, color):
-        self.result = color
-        self.destroy()
+        self.result = color; self.destroy()
 
 
 class AudioDeviceDialog(tk.Toplevel):
     def __init__(self, parent, pyaudio_instance, current_settings, theme=None):
         super().__init__(parent)
-        self.p = pyaudio_instance
-        self.result = current_settings.copy()
+        self.p = pyaudio_instance; self.result = current_settings.copy()
         self.t = theme or _fallback_theme()
-
         self.title("Audio Devices & Volume")
         self.configure(bg=self.t['glass_bg'])
-        self.resizable(False, False)
-        self.geometry("500x650")
-
+        self.resizable(False, False); self.geometry("500x650")
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 250
         y = (self.winfo_screenheight() // 2) - 325
         self.geometry(f'500x650+{x}+{y}')
-
-        self.transient(parent)
-        self.grab_set()
+        self.transient(parent); self.grab_set()
 
         tk.Label(self, text="🎧 AUDIO SETTINGS", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 16, 'bold')).pack(pady=20)
-
-        self.input_devices  = []
-        self.output_devices = []
+        self.input_devices = []; self.output_devices = []
         self.get_audio_devices()
 
         def section(label_text):
@@ -577,37 +590,32 @@ class AudioDeviceDialog(tk.Toplevel):
                      highlightthickness=0, bd=0,
                      command=lambda v, l=lbl, dv=var: (l.config(text=f"{int(dv.get())}%"),
                                                         callback())).pack(fill=tk.X, padx=10, pady=(0, 15))
-            return lbl
 
         in_frame = section("INPUT DEVICE (Microphone)")
         self.input_var = tk.StringVar(value=self.result.get('input_device') or
                                       (self.input_devices[0] if self.input_devices else "Default"))
         in_combo = ttk.Combobox(in_frame, textvariable=self.input_var,
                                 values=self.input_devices, state='readonly', width=50)
-        in_combo.pack(padx=10, pady=5)
-        self.style_combobox(in_combo)
+        in_combo.pack(padx=10, pady=5); self.style_combobox(in_combo)
         self.input_volume = tk.DoubleVar(value=self.result.get('input_volume', 100))
         vol_row(in_frame, "Input Volume", self.input_volume,
                 lambda: self.result.update({'input_volume': self.input_volume.get()}))
         tk.Button(in_frame, text="🎤 Test Microphone", bg=self.t['glass_bg'], fg=self.t['fg_color'],
-                  font=('Segoe UI', 9), relief=tk.FLAT,
-                  command=self.test_input_device, padx=15, pady=5,
-                  cursor='hand2').pack(pady=(0, 15))
+                  font=('Segoe UI', 9), relief=tk.FLAT, command=self.test_input_device,
+                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 15))
 
         out_frame = section("OUTPUT DEVICE (Speakers/Headphones)")
         self.output_var = tk.StringVar(value=self.result.get('output_device') or
                                        (self.output_devices[0] if self.output_devices else "Default"))
         out_combo = ttk.Combobox(out_frame, textvariable=self.output_var,
                                  values=self.output_devices, state='readonly', width=50)
-        out_combo.pack(padx=10, pady=5)
-        self.style_combobox(out_combo)
+        out_combo.pack(padx=10, pady=5); self.style_combobox(out_combo)
         self.output_volume = tk.DoubleVar(value=self.result.get('output_volume', 100))
         vol_row(out_frame, "Output Volume", self.output_volume,
                 lambda: self.result.update({'output_volume': self.output_volume.get()}))
         tk.Button(out_frame, text="🔊 Test Speakers", bg=self.t['glass_bg'], fg=self.t['fg_color'],
-                  font=('Segoe UI', 9), relief=tk.FLAT,
-                  command=self.test_output_device, padx=15, pady=5,
-                  cursor='hand2').pack(pady=(0, 15))
+                  font=('Segoe UI', 9), relief=tk.FLAT, command=self.test_output_device,
+                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 15))
 
         rate_frame = tk.Frame(self, bg=self.t['glass_accent'])
         rate_frame.pack(fill=tk.X, padx=20, pady=10)
@@ -620,15 +628,14 @@ class AudioDeviceDialog(tk.Toplevel):
         btn_frame = tk.Frame(self, bg=self.t['glass_bg'])
         btn_frame.pack(pady=20)
         tk.Button(btn_frame, text="SAVE SETTINGS", bg=self.t['accent_1'], fg=self.t['send_btn_fg'],
-                  font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
-                  command=self.save_settings, padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
+                  font=('Segoe UI', 11, 'bold'), relief=tk.FLAT, command=self.save_settings,
+                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
         tk.Button(btn_frame, text="CANCEL", bg=self.t['accent_2'], fg='#fff',
-                  font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
-                  command=self.destroy, padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
+                  font=('Segoe UI', 11, 'bold'), relief=tk.FLAT, command=self.destroy,
+                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
 
     def style_combobox(self, combobox):
-        style = ttk.Style()
-        style.theme_use('clam')
+        style = ttk.Style(); style.theme_use('clam')
         style.configure("TCombobox", fieldbackground='#ffffff', background='#ffffff',
                         foreground='#000000', arrowcolor=self.t['accent_1'],
                         selectbackground=self.t['accent_1'], selectforeground='#000',
@@ -638,12 +645,10 @@ class AudioDeviceDialog(tk.Toplevel):
     def get_audio_devices(self):
         try:
             self.input_devices.append(f"Default ({self.p.get_default_input_device_info()['name']})")
-        except:
-            self.input_devices.append("Default")
+        except: self.input_devices.append("Default")
         try:
             self.output_devices.append(f"Default ({self.p.get_default_output_device_info()['name']})")
-        except:
-            self.output_devices.append("Default")
+        except: self.output_devices.append("Default")
         for i in range(self.p.get_device_count()):
             try:
                 d = self.p.get_device_info_by_index(i)
@@ -651,48 +656,34 @@ class AudioDeviceDialog(tk.Toplevel):
                     self.input_devices.append(f"Device {i}: {d['name']}")
                 if d['maxOutputChannels'] > 0:
                     self.output_devices.append(f"Device {i}: {d['name']}")
-            except:
-                continue
+            except: continue
 
     def test_input_device(self):
         try:
-            device_name  = self.input_var.get()
-            device_index = None
+            device_name = self.input_var.get(); device_index = None
             if not device_name.startswith("Default"):
-                try:
-                    device_index = int(device_name.split("Device ")[1].split(":")[0])
-                except:
-                    pass
-
-            stream = None
-            used_rate = None
+                try: device_index = int(device_name.split("Device ")[1].split(":")[0])
+                except: pass
+            stream = None; used_rate = None
             for rate in SUPPORTED_RATES:
                 try:
                     stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
                                          input=True, input_device_index=device_index,
                                          frames_per_buffer=CHUNK)
-                    used_rate = rate
-                    break
-                except:
-                    continue
-
-            if stream is None:
-                raise Exception("Could not open device at any sample rate")
+                    used_rate = rate; break
+                except: continue
+            if stream is None: raise Exception("Could not open device at any sample rate")
 
             test_dialog = tk.Toplevel(self)
             test_dialog.title("Microphone Test")
-            test_dialog.configure(bg=self.t['glass_bg'])
-            test_dialog.geometry("300x220")
+            test_dialog.configure(bg=self.t['glass_bg']); test_dialog.geometry("300x220")
             x = (self.winfo_screenwidth() // 2) - 150
             y = (self.winfo_screenheight() // 2) - 110
             test_dialog.geometry(f'300x220+{x}+{y}')
-
             tk.Label(test_dialog, text="🎤 Testing Microphone", bg=self.t['glass_bg'],
                      fg=self.t['accent_1'], font=('Segoe UI', 12, 'bold')).pack(pady=20)
             tk.Label(test_dialog, text=f"Sample Rate: {used_rate} Hz",
-                     bg=self.t['glass_bg'], fg=self.t['fg_color'],
-                     font=('Segoe UI', 9)).pack(pady=5)
-
+                     bg=self.t['glass_bg'], fg=self.t['fg_color'], font=('Segoe UI', 9)).pack(pady=5)
             vu_label = tk.Label(test_dialog, text="●", bg=self.t['glass_bg'],
                                 fg=self.t['accent_1'], font=('Segoe UI', 20))
             vu_label.pack(pady=10)
@@ -707,17 +698,13 @@ class AudioDeviceDialog(tk.Toplevel):
                                         else (self.t['accent_4'] if vol < 70
                                               else self.t['accent_2'])))
                     test_dialog.after(50, update_vu)
-                except:
-                    pass
+                except: pass
 
             update_vu()
 
             def close_test():
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except:
-                    pass
+                try: stream.stop_stream(); stream.close()
+                except: pass
                 test_dialog.destroy()
 
             tk.Button(test_dialog, text="STOP TEST", bg=self.t['accent_2'], fg='#fff',
@@ -728,29 +715,19 @@ class AudioDeviceDialog(tk.Toplevel):
 
     def test_output_device(self):
         try:
-            device_name  = self.output_var.get()
-            device_index = None
+            device_name = self.output_var.get(); device_index = None
             if not device_name.startswith("Default"):
-                try:
-                    device_index = int(device_name.split("Device ")[1].split(":")[0])
-                except:
-                    pass
-
-            stream = None
-            used_rate = None
+                try: device_index = int(device_name.split("Device ")[1].split(":")[0])
+                except: pass
+            stream = None; used_rate = None
             for rate in SUPPORTED_RATES:
                 try:
                     stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
                                          output=True, output_device_index=device_index,
                                          frames_per_buffer=CHUNK)
-                    used_rate = rate
-                    break
-                except:
-                    continue
-
-            if stream is None:
-                raise Exception("Could not open device at any sample rate")
-
+                    used_rate = rate; break
+                except: continue
+            if stream is None: raise Exception("Could not open device at any sample rate")
             try:
                 import numpy as np
                 samples = (np.sin(2 * np.pi * np.arange(int(used_rate * 0.5)) * 440 / used_rate)).astype(np.float32)
@@ -762,10 +739,7 @@ class AudioDeviceDialog(tk.Toplevel):
             except ImportError:
                 test_audio = b'\x00\x00' * (used_rate // 10)
                 messagebox.showwarning("NumPy Missing", "Install numpy for better test tones")
-
-            stream.write(test_audio)
-            stream.stop_stream()
-            stream.close()
+            stream.write(test_audio); stream.stop_stream(); stream.close()
             messagebox.showinfo("Test Complete", f"Test tone played at {used_rate} Hz!")
         except Exception as e:
             messagebox.showerror("Test Failed", f"Could not test speakers: {str(e)}")
@@ -775,17 +749,12 @@ class AudioDeviceDialog(tk.Toplevel):
         self.result['output_device'] = self.output_var.get()
         self.result['input_volume']  = self.input_volume.get()
         self.result['output_volume'] = self.output_volume.get()
-
-        for key, var in (('input_device', 'input_device_index'),
-                         ('output_device', 'output_device_index')):
+        for key, var in (('input_device', 'input_device_index'), ('output_device', 'output_device_index')):
             if not self.result[key].startswith("Default"):
-                try:
-                    self.result[var] = int(self.result[key].split("Device ")[1].split(":")[0])
-                except:
-                    self.result[var] = None
+                try: self.result[var] = int(self.result[key].split("Device ")[1].split(":")[0])
+                except: self.result[var] = None
             else:
                 self.result[var] = None
-
         self.destroy()
 
 
@@ -803,12 +772,13 @@ class HavenClient:
         self.user_colors = {}
         self.server_assigned_color = None
         self._tcp_buffer = ''
+        self.tray_icon   = None
 
         config = self.load_config()
-        self.ptt_key      = config.get('ptt_key', 'Control_L')
-        self.name_color   = config.get('name_color', self.generate_random_color())
-        self.theme_name   = config.get('theme', 'default')
-        self.theme        = load_theme(self.theme_name)
+        self.ptt_key    = config.get('ptt_key', 'Control_L')
+        self.name_color = config.get('name_color', self.generate_random_color())
+        self.theme_name = config.get('theme', 'default')
+        self.theme      = load_theme(self.theme_name)
 
         self.audio_settings = {
             'input_device':        config.get('input_device', 'Default'),
@@ -827,7 +797,6 @@ class HavenClient:
         saved_password = config.get('password', '')
 
         connected = False
-
         if server_ip and saved_username and saved_password:
             result = self._attempt_connect(server_ip, saved_username, saved_password)
             if result == 'ok':
@@ -865,57 +834,91 @@ class HavenClient:
         self.stream_in    = None
         self.stream_out   = None
         self.voice_active = False
-
         self.active_speakers = set()
         self.speaker_labels  = {}
+
+        # Start system tray BEFORE network threads
+        self._start_tray()
 
         threading.Thread(target=self.receive_tcp, daemon=True).start()
         threading.Thread(target=self.receive_udp, daemon=True).start()
 
         self.setup_global_hotkey()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
         self.root.mainloop()
+
+    # ── System Tray ──────────────────────────────────────────────
+
+    def _start_tray(self):
+        """Spin up the pystray icon in its own daemon thread."""
+        if not TRAY_AVAILABLE:
+            return
+
+        img = load_tray_image()
+        if img is None:
+            return
+
+        menu = pystray.Menu(
+            pystray.MenuItem('Haven Chat', self._tray_restore, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem('Restore', self._tray_restore),
+            pystray.MenuItem('Quit',    self._tray_quit),
+        )
+
+        self.tray_icon = pystray.Icon('haven_chat', img, 'Haven Chat', menu)
+
+        # Run the tray icon in a background thread — it has its own event loop
+        tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        tray_thread.start()
+
+    def _tray_restore(self, icon=None, item=None):
+        """Called from the tray — must schedule UI work on the tkinter thread."""
+        self.root.after(0, self._show_window)
+
+    def _tray_quit(self, icon=None, item=None):
+        """Quit from the tray menu."""
+        self.root.after(0, self.on_close)
+
+    def _show_window(self):
+        """Restore the window from tray/hidden state."""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.root.attributes('-topmost', True)
+        self.root.after(100, lambda: self.root.attributes('-topmost', False))
+
+    def minimize_to_tray(self):
+        """Hide the window — tray icon stays visible for restore."""
+        self.root.withdraw()
 
     # ── Theme ────────────────────────────────────────────────────
 
     def apply_theme(self, theme_name):
+        """Save the new theme and restart the client process cleanly."""
         self.theme_name = theme_name
-        self.theme      = load_theme(theme_name)
         self.save_config()
-
-        for widget in self.root.winfo_children():
-            widget.destroy()
-
-        self.root.configure(bg=self.theme['bg_color'])
-        self.speaker_labels  = {}
-        self.active_speakers = set()
-
-        self.build_ui()
-
-        users_with_colors = [{'username': u, 'color': c} for u, c in self.user_colors.items()]
-        self.update_userlist_with_colors(users_with_colors)
-
-        self.display_system_message(f"✓ Theme changed to '{self.theme.get('name', theme_name)}'")
+        if self.tray_icon:
+            try: self.tray_icon.stop()
+            except: pass
+        self.running = False
+        subprocess.Popen([sys.executable] + sys.argv)
+        self.root.destroy()
 
     # ── Login helpers ────────────────────────────────────────────
 
     def _run_login_loop(self, config, prefill=None, error_msg=None):
         current_prefill = prefill or {}
         current_error   = error_msg
-
         while True:
             self.root.deiconify()
             dialog = LoginScreen(self.root, self.theme,
                                  prefill=current_prefill, error_msg=current_error)
             self.root.wait_window(dialog)
             self.root.withdraw()
-
             if dialog.result is None:
                 return False
-
             data   = dialog.result
             result = self._attempt_connect(data['server_ip'], data['username'], data['password'])
-
             if result == 'ok':
                 config['server_ip'] = data['server_ip']
                 config['username']  = data['username']
@@ -923,14 +926,12 @@ class HavenClient:
                     config['password'] = data['password']
                 elif 'password' in config:
                     del config['password']
-
                 self.server_ip = data['server_ip']
                 self.username  = data['username']
                 self.password  = data['password']
                 self.saved_password = data['password'] if data['remember'] else None
                 self.save_config()
                 return True
-
             elif result == 'auth_failed':
                 current_error   = "⚠  Incorrect password. Please try again."
                 current_prefill = {'server_ip': data['server_ip'],
@@ -941,16 +942,8 @@ class HavenClient:
                                    'username': data['username'], 'password': ''}
 
     def _attempt_connect(self, server_ip, username, password):
-        """
-        Updated auth flow to match the hardened server:
-          1. Open a TLS-wrapped TCP connection
-          2. Receive the server's challenge nonce
-          3. Compute challenge response: SHA256(nonce + ":" + SHA256(password))
-          4. Send login message with auth_response instead of raw password_hash
-        """
         try:
-            tls_ctx = create_tls_context()
-
+            tls_ctx  = create_tls_context()
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             raw_sock.settimeout(10)
             raw_sock.connect((server_ip, SERVER_TCP_PORT))
@@ -962,9 +955,7 @@ class HavenClient:
 
             password_hash = compute_password_hash(password)
 
-            # Wait for challenge from server
-            buffer = ''
-            nonce = None
+            buffer = ''; nonce = None
             while nonce is None:
                 chunk = tcp_sock.recv(4096).decode('utf-8', errors='replace')
                 if not chunk:
@@ -973,33 +964,23 @@ class HavenClient:
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
                     line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    if not line: continue
+                    try: msg = json.loads(line)
+                    except json.JSONDecodeError: continue
                     if msg.get('type') == 'challenge':
-                        nonce = msg['nonce']
-                        break
+                        nonce = msg['nonce']; break
                     elif msg.get('type') == 'error':
                         raise ConnectionError(msg.get('message', 'Server error'))
 
             if not nonce:
                 raise ConnectionError("Did not receive challenge from server")
 
-            # Compute and send challenge response
             auth_response = compute_auth_response(nonce, password_hash)
-            login_msg = json.dumps({
-                'type': 'login',
-                'username': username,
-                'udp_port': udp_port,
-                'auth_response': auth_response,
-                'user_color': self.name_color
-            }) + '\n'
-            tcp_sock.send(login_msg.encode())
+            tcp_sock.send((json.dumps({
+                'type': 'login', 'username': username, 'udp_port': udp_port,
+                'auth_response': auth_response, 'user_color': self.name_color
+            }) + '\n').encode())
 
-            # Wait for auth result
             tcp_sock.settimeout(10)
             while True:
                 chunk = tcp_sock.recv(4096).decode('utf-8', errors='replace')
@@ -1009,47 +990,31 @@ class HavenClient:
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
                     line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    if not line: continue
+                    try: msg = json.loads(line)
+                    except json.JSONDecodeError: continue
 
                     if msg['type'] == 'auth_ok':
                         tcp_sock.settimeout(None)
-                        self.tcp_sock      = tcp_sock
-                        self.udp_sock      = udp_sock
-                        self.udp_port      = udp_port
-                        self.server_ip     = server_ip
-                        self.username      = username
-                        self.password      = password
-                        self.running       = True
-                        self.authenticated = True
-                        self._tcp_buffer   = buffer  # pass leftover buffer to receive_tcp
+                        self.tcp_sock = tcp_sock; self.udp_sock = udp_sock
+                        self.udp_port = udp_port; self.server_ip = server_ip
+                        self.username = username; self.password  = password
+                        self.running  = True; self.authenticated = True
+                        self._tcp_buffer = buffer
                         if 'user_color' in msg:
                             self.server_assigned_color = msg['user_color']
                             self.name_color = msg['user_color']
                         return 'ok'
-
                     elif msg['type'] == 'auth_failed':
-                        tcp_sock.close()
-                        udp_sock.close()
-                        return 'auth_failed'
-
+                        tcp_sock.close(); udp_sock.close(); return 'auth_failed'
                     elif msg['type'] == 'error':
-                        tcp_sock.close()
-                        udp_sock.close()
+                        tcp_sock.close(); udp_sock.close()
                         return msg.get('message', 'Server error')
 
-        except ssl.SSLError as e:
-            return f'TLS error: {e}'
-        except socket.timeout:
-            return 'Connection timed out'
-        except ConnectionRefusedError:
-            return 'Connection refused (is the server running?)'
-        except Exception as e:
-            return str(e)
+        except ssl.SSLError as e:   return f'TLS error: {e}'
+        except socket.timeout:      return 'Connection timed out'
+        except ConnectionRefusedError: return 'Connection refused (is the server running?)'
+        except Exception as e:      return str(e)
 
     # ── Config ───────────────────────────────────────────────────
 
@@ -1058,8 +1023,7 @@ class HavenClient:
             try:
                 with open(CONFIG_FILE, 'r') as f:
                     return json.load(f)
-            except:
-                pass
+            except: pass
         return {}
 
     def save_config(self):
@@ -1089,12 +1053,10 @@ class HavenClient:
     def fade_color(self, color, factor):
         try:
             color = color.lstrip('#')
-            if len(color) == 3:
-                color = ''.join([c * 2 for c in color])
+            if len(color) == 3: color = ''.join([c * 2 for c in color])
             r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
             return f'#{int(r*factor):02x}{int(g*factor):02x}{int(b*factor):02x}'
-        except:
-            return color
+        except: return color
 
     # ── GUI ──────────────────────────────────────────────────────
 
@@ -1105,6 +1067,7 @@ class HavenClient:
         self.canvas_bg.place(x=0, y=0, relwidth=1, relheight=1)
         self.draw_background()
 
+        # Title bar
         title_bar = tk.Frame(self.root, bg=t['titlebar_bg'], height=35)
         title_bar.pack(fill=tk.X, side=tk.TOP)
         title_bar.pack_propagate(False)
@@ -1124,11 +1087,9 @@ class HavenClient:
                                           activebackground=t['accent_3'],
                                           activeforeground=t['fg_color'],
                                           relief=tk.FLAT, bd=0, padx=8, pady=2)
-
         settings_menu = Menu(self.settings_btn, tearoff=0,
                              bg=t['glass_accent'], fg=t['fg_color'],
-                             activebackground=t['accent_1'],
-                             activeforeground='#000',
+                             activebackground=t['accent_1'], activeforeground='#000',
                              relief=tk.FLAT, bd=1)
         settings_menu.add_command(label="Change Username",        command=self.change_username)
         settings_menu.add_command(label="Change Name Color",      command=self.change_name_color)
@@ -1145,10 +1106,11 @@ class HavenClient:
         controls_frame = tk.Frame(title_bar, bg=t['titlebar_bg'])
         controls_frame.pack(side=tk.RIGHT, padx=5)
 
+        # Minimize button now hides to tray
         tk.Button(controls_frame, text="─", bg=t['titlebar_bg'], fg=t['titlebar_fg'],
                   font=('Segoe UI', 14), bd=0,
                   activebackground=t['accent_3'], activeforeground=t['fg_color'],
-                  command=self.minimize_window, cursor='hand2',
+                  command=self.minimize_to_tray, cursor='hand2',
                   padx=8, pady=0).pack(side=tk.LEFT, padx=2)
 
         tk.Button(controls_frame, text="✕", bg=t['titlebar_bg'], fg=t['titlebar_fg'],
@@ -1157,18 +1119,11 @@ class HavenClient:
                   command=self.on_close, cursor='hand2',
                   padx=8, pady=0).pack(side=tk.LEFT, padx=2)
 
-        def start_move(event):
-            self.x = event.x
-            self.y = event.y
-
-        def stop_move(event):
-            self.x = None
-            self.y = None
-
+        def start_move(event): self.x = event.x; self.y = event.y
+        def stop_move(event):  self.x = None;    self.y = None
         def do_move(event):
             if self.x is not None and self.y is not None:
-                dx = event.x - self.x
-                dy = event.y - self.y
+                dx = event.x - self.x; dy = event.y - self.y
                 self.root.geometry(f"+{self.root.winfo_x()+dx}+{self.root.winfo_y()+dy}")
 
         for w in (title_bar, app_title, app_icon):
@@ -1205,8 +1160,7 @@ class HavenClient:
 
         self.chat_text = tk.Text(chat_container, bg=t['chat_bg'], fg=t['chat_fg'],
                                  insertbackground=t['accent_1'], wrap=tk.WORD,
-                                 state=tk.DISABLED,
-                                 font=(t['chat_font'], t['chat_font_size']),
+                                 state=tk.DISABLED, font=(t['chat_font'], t['chat_font_size']),
                                  relief=tk.FLAT, padx=15, pady=15, spacing3=5)
         self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -1219,7 +1173,6 @@ class HavenClient:
         entry_container = tk.Frame(left_frame, bg=t['glass_accent'], height=50)
         entry_container.pack(fill=tk.X)
         entry_container.pack_propagate(False)
-
         entry_inner = tk.Frame(entry_container, bg=t['glass_accent'])
         entry_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -1229,8 +1182,7 @@ class HavenClient:
         self.msg_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         self.msg_entry.bind('<Return>', self.send_chat)
 
-        tk.Button(entry_inner, text="SEND ➤",
-                  bg=t['send_btn_bg'], fg=t['send_btn_fg'],
+        tk.Button(entry_inner, text="SEND ➤", bg=t['send_btn_bg'], fg=t['send_btn_fg'],
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT, bd=0,
                   cursor='hand2', activebackground=t['accent_4'],
                   command=self.send_chat, padx=20, pady=8).pack(side=tk.RIGHT)
@@ -1238,7 +1190,6 @@ class HavenClient:
         voice_container = tk.Frame(left_frame, bg=t['glass_accent'], height=60)
         voice_container.pack(fill=tk.X, pady=(10, 0))
         voice_container.pack_propagate(False)
-
         voice_inner = tk.Frame(voice_container, bg=t['glass_accent'])
         voice_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
@@ -1266,8 +1217,7 @@ class HavenClient:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar_users = tk.Scrollbar(user_list_container, orient=tk.VERTICAL,
-                                       command=canvas.yview,
-                                       bg=t['scrollbar_bg'],
+                                       command=canvas.yview, bg=t['scrollbar_bg'],
                                        troughcolor=t['scrollbar_trough'],
                                        activebackground=t['accent_1'])
         scrollbar_users.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1275,7 +1225,6 @@ class HavenClient:
         self.user_list_frame = tk.Frame(canvas, bg=t['userlist_bg'])
         canvas_window = canvas.create_window((0, 0), window=self.user_list_frame, anchor=tk.NW)
         canvas.configure(yscrollcommand=scrollbar_users.set)
-
         self.user_list_frame.bind('<Configure>',
                                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind('<Configure>',
@@ -1295,28 +1244,13 @@ class HavenClient:
             self.canvas_bg.create_line(0, i, w, i, fill=f'#{r:02x}{g:02x}{b:02x}')
         for i in range(5):
             y = (i + 1) * (h / 6)
-            self.canvas_bg.create_line(0, y, w, y, fill=gl,
-                                       width=1, dash=(10, 20), stipple='gray50')
-
-    def minimize_window(self):
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
-        self.root.overrideredirect(False)
-        self.root.iconify()
-
-        def on_deiconify(event=None):
-            self.root.overrideredirect(True)
-            self.root.geometry(f'+{x}+{y}')
-            self.root.unbind('<Map>')
-
-        self.root.bind('<Map>', on_deiconify)
+            self.canvas_bg.create_line(0, y, w, y, fill=gl, width=1, dash=(10, 20), stipple='gray50')
 
     def show_about(self):
         t = self.theme
         messagebox.showinfo("About Haven Chat",
-                            f"Haven Chat v2.0\n\nCurrent theme: {t.get('name', self.theme_name)}\n\n"
-                            "A hopefully secure voice and text chat client\n"
-                            "with vibes and dreams.\n\n"
+                            f"Haven Chat v2.1\n\nCurrent theme: {t.get('name', self.theme_name)}\n\n"
+                            "A hopefully secure voice and text chat client\nwith vibes and dreams.\n\n"
                             "✨ By downloading, installing, or using this Software, you hereby affirm to uphold truth, justice, equity, and the democratic ideals of the American way. You further acknowledge and agree to defend and respect the sovereignty, self-determination, and human rights of all peoples, including but not limited to those of Ukraine, Palestine, Taiwan, Hong Kong, Tibet, Sudan, and any nation or community striving toward freedom and dignity. You strive to uphold the right of every person to live authentically, free from discrimination or harm, regardless of race, creed, sexual orientation, or gender identity and expression. Use of this Software constitutes your pledge to counter oppression, misinformation, and authoritarianism in all forms, and to act in good faith toward a more just, accepting, tolerant and sustainable world. ✨\n\n")
 
     def format_key_display(self, key):
@@ -1336,12 +1270,9 @@ class HavenClient:
         self.current_keys    = set()
         self.current_buttons = set()
         self.key_map = {
-            'Control_L': keyboard.Key.ctrl_l,
-            'Control_R': keyboard.Key.ctrl,
-            'Alt_L':     keyboard.Key.alt_l,
-            'Alt_R':     keyboard.Key.alt,
-            'Shift_L':   keyboard.Key.shift_l,
-            'Shift_R':   keyboard.Key.shift,
+            'Control_L': keyboard.Key.ctrl_l, 'Control_R': keyboard.Key.ctrl,
+            'Alt_L':     keyboard.Key.alt_l,  'Alt_R':     keyboard.Key.alt,
+            'Shift_L':   keyboard.Key.shift_l,'Shift_R':   keyboard.Key.shift,
             'space':     keyboard.Key.space,
         }
         self.keyboard_listener = keyboard.Listener(
@@ -1354,95 +1285,66 @@ class HavenClient:
         try:
             if self.ptt_key in self.key_map:
                 ptt_key = self.key_map[self.ptt_key]
-                right_variant = None
-                if self.ptt_key.endswith('_L'):
-                    right_variant = self.key_map.get(self.ptt_key[:-1] + 'R')
+                right_variant = self.key_map.get(self.ptt_key[:-1] + 'R') if self.ptt_key.endswith('_L') else None
                 if key == ptt_key or (right_variant and key == right_variant):
                     if key not in self.current_keys:
-                        self.current_keys.add(key)
-                        self.root.after(0, self.start_voice)
+                        self.current_keys.add(key); self.root.after(0, self.start_voice)
             else:
                 key_str = key.char if (hasattr(key, 'char') and key.char) else str(key)
                 if key_str == self.ptt_key and key not in self.current_keys:
-                    self.current_keys.add(key)
-                    self.root.after(0, self.start_voice)
-        except AttributeError:
-            pass
+                    self.current_keys.add(key); self.root.after(0, self.start_voice)
+        except AttributeError: pass
 
     def on_global_key_release(self, key):
         try:
             if self.ptt_key in self.key_map:
                 ptt_key = self.key_map[self.ptt_key]
-                right_variant = None
-                if self.ptt_key.endswith('_L'):
-                    right_variant = self.key_map.get(self.ptt_key[:-1] + 'R')
+                right_variant = self.key_map.get(self.ptt_key[:-1] + 'R') if self.ptt_key.endswith('_L') else None
                 if key == ptt_key or (right_variant and key == right_variant):
-                    self.current_keys.discard(key)
-                    self.root.after(0, self.stop_voice)
+                    self.current_keys.discard(key); self.root.after(0, self.stop_voice)
             else:
                 key_str = key.char if (hasattr(key, 'char') and key.char) else str(key)
                 if key_str == self.ptt_key:
-                    self.current_keys.discard(key)
-                    self.root.after(0, self.stop_voice)
-        except AttributeError:
-            pass
+                    self.current_keys.discard(key); self.root.after(0, self.stop_voice)
+        except AttributeError: pass
 
     def on_global_mouse_click(self, x, y, button, pressed):
-        if not self.ptt_key.startswith('mouse_'):
-            return
+        if not self.ptt_key.startswith('mouse_'): return
         button_str = f'mouse_{str(button).replace("Button.", "")}'
         if button_str == self.ptt_key:
             if pressed:
                 if button not in self.current_buttons:
-                    self.current_buttons.add(button)
-                    self.root.after(0, self.start_voice)
+                    self.current_buttons.add(button); self.root.after(0, self.start_voice)
             else:
-                self.current_buttons.discard(button)
-                self.root.after(0, self.stop_voice)
+                self.current_buttons.discard(button); self.root.after(0, self.stop_voice)
 
     # ── Network ──────────────────────────────────────────────────
 
     def receive_tcp(self):
         buffer = getattr(self, '_tcp_buffer', '')
         self._tcp_buffer = ''
-
         while self.running:
-            # Process any complete messages already in buffer
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                if not line.strip(): continue
+                try: msg = json.loads(line)
+                except json.JSONDecodeError: continue
                 self.root.after(0, lambda m=msg: self.handle_tcp_message(m))
-
             try:
                 data = self.tcp_sock.recv(4096).decode('utf-8', errors='replace')
-                if not data:
-                    break
+                if not data: break
                 buffer += data
-
-                # Prevent memory exhaustion from a malicious/broken server
                 if len(buffer) > MAX_TCP_BUFFER:
-                    print("TCP buffer overflow — disconnecting")
-                    break
-
-            except ssl.SSLError:
-                break
-            except OSError:
-                break
-            except Exception:
-                break
-
+                    print("TCP buffer overflow — disconnecting"); break
+            except ssl.SSLError: break
+            except OSError: break
+            except Exception: break
         if self.running:
             self.root.after(0, self.connection_lost)
 
     def connection_lost(self):
         if not self._closing:
-            if hasattr(self, 'saved_password'):
-                self.saved_password = None
+            if hasattr(self, 'saved_password'): self.saved_password = None
             self.save_config()
             messagebox.showerror("Connection Lost",
                                  "Lost connection to the server.\nYou will need to reconnect.")
@@ -1450,74 +1352,53 @@ class HavenClient:
 
     def handle_tcp_message(self, msg):
         t = self.theme
-
         if msg['type'] == 'auth_ok':
             if 'user_color' in msg:
                 self.server_assigned_color = msg['user_color']
-                self.name_color = msg['user_color']
-                self.save_config()
+                self.name_color = msg['user_color']; self.save_config()
             self.display_system_message("✓ Connected to server")
-
         elif msg['type'] == 'auth_failed':
             messagebox.showerror("Authentication Failed", "Incorrect password")
             self.root.after(0, self.on_close)
-
         elif msg['type'] == 'chat':
             self.display_message(msg['user'], msg['text'])
-
         elif msg['type'] == 'chat_history':
             for chat_msg in msg['history']:
-                user         = chat_msg['user']
-                text         = chat_msg['text']
-                timestamp    = chat_msg.get('timestamp')
-                stored_color = chat_msg.get('color')
+                user = chat_msg['user']; text = chat_msg['text']
+                timestamp = chat_msg.get('timestamp'); stored_color = chat_msg.get('color')
                 if user == 'System':
-                    self.display_message(user, text, timestamp=timestamp,
-                                         color=t['system_msg_color'])
+                    self.display_message(user, text, timestamp=timestamp, color=t['system_msg_color'])
                 else:
                     if user not in self.user_colors and stored_color:
                         self.user_colors[user] = stored_color
                     display_color = stored_color or self.user_colors.get(user, t['accent_2'])
                     self.display_message(user, text, timestamp=timestamp, color=display_color)
             self.display_system_message("✓ Chat history loaded")
-
         elif msg['type'] == 'userlist_full':
             self.update_userlist_with_colors(msg['users'])
-
         elif msg['type'] == 'userlist':
-            self.update_userlist_with_colors(
-                [{'username': u, 'color': t['accent_2']} for u in msg['users']])
-
+            self.update_userlist_with_colors([{'username': u, 'color': t['accent_2']} for u in msg['users']])
         elif msg['type'] == 'user_color_changed':
             self.update_user_color(msg['username'], msg['color'])
-
         elif msg['type'] == 'voice_start':
             self.set_user_voice_active(msg['user'], True)
-
         elif msg['type'] == 'voice_stop':
             self.set_user_voice_active(msg['user'], False)
-
         elif msg['type'] == 'username_changed':
             self.display_system_message(f"✓ Username changed to {msg['new_username']}")
-            old_username = self.username
-            self.username = msg['new_username']
+            old_username = self.username; self.username = msg['new_username']
             if 'user_color' in msg:
-                self.name_color = msg['user_color']
-                self.server_assigned_color = msg['user_color']
+                self.name_color = msg['user_color']; self.server_assigned_color = msg['user_color']
             self.save_config()
             if old_username in self.speaker_labels:
-                self.speaker_labels[old_username].destroy()
-                del self.speaker_labels[old_username]
+                self.speaker_labels[old_username].destroy(); del self.speaker_labels[old_username]
             self.add_user_to_list(self.username, self.name_color)
-
         elif msg['type'] == 'kicked':
             messagebox.showerror("Kicked", "You have been kicked from the server.")
             self.root.after(0, self.on_close)
-
         elif msg['type'] == 'banned':
             messagebox.showerror("Banned", "You have been banned from the server.")
             self.root.after(0, self.on_close)
-
         elif msg['type'] == 'error':
             messagebox.showerror("Error", msg['message'])
 
@@ -1534,29 +1415,20 @@ class HavenClient:
                                     format=FORMAT, channels=CHANNELS, rate=rate,
                                     output=True, output_device_index=device_index,
                                     frames_per_buffer=CHUNK)
-                                self.current_output_rate = rate
-                                break
-                            except:
-                                continue
+                                self.current_output_rate = rate; break
+                            except: continue
                     except Exception as e:
-                        print(f"Failed to open output stream: {e}")
-                        continue
-
+                        print(f"Failed to open output stream: {e}"); continue
                 volume = self.audio_settings.get('output_volume', 100) / 100
                 if volume != 1.0:
                     try:
                         import numpy as np
                         audio_data = np.frombuffer(data, dtype=np.int16)
                         data = (audio_data * volume).astype(np.int16).tobytes()
-                    except ImportError:
-                        pass
-
+                    except ImportError: pass
                 self.stream_out.write(data)
-            except OSError:
-                break
-            except Exception as e:
-                print(f"Error in receive_udp: {e}")
-                break
+            except OSError: break
+            except Exception as e: print(f"Error in receive_udp: {e}"); break
 
     def send_chat(self, event=None):
         text = self.msg_entry.get().strip()
@@ -1565,15 +1437,12 @@ class HavenClient:
                 self.tcp_sock.send((json.dumps({'type': 'chat', 'text': text}) + '\n').encode())
                 self.msg_entry.delete(0, tk.END)
                 self.display_message(self.username, text, align='right')
-            except:
-                messagebox.showerror("Error", "Failed to send message")
+            except: messagebox.showerror("Error", "Failed to send message")
 
     def display_message(self, user, text, align='left', timestamp=None, color=None):
         t = self.theme
         self.chat_text.config(state=tk.NORMAL)
-        if timestamp is None:
-            timestamp = datetime.now().strftime('%H:%M')
-
+        if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
         if align == 'right':
             self.chat_text.insert(tk.END, f'{text}  ', 'right_text')
             self.chat_text.insert(tk.END, f'[{timestamp} - {user}]\n', 'right_meta')
@@ -1585,19 +1454,16 @@ class HavenClient:
             self.chat_text.insert(tk.END, f'[{timestamp}] ', 'timestamp')
             if user == 'System':
                 self.chat_text.insert(tk.END, f'{user}: ', 'username_system')
-                self.chat_text.tag_config('username_system',
-                                          foreground=t['system_msg_color'],
+                self.chat_text.tag_config('username_system', foreground=t['system_msg_color'],
                                           font=('Segoe UI', 10, 'bold'))
             else:
                 user_color = color or self.user_colors.get(user, t['accent_2'])
                 tag_name = f'username_{user}'
                 self.chat_text.insert(tk.END, f'{user}: ', tag_name)
-                self.chat_text.tag_config(tag_name, foreground=user_color,
-                                          font=('Segoe UI', 10, 'bold'))
+                self.chat_text.tag_config(tag_name, foreground=user_color, font=('Segoe UI', 10, 'bold'))
             self.chat_text.insert(tk.END, f'{text}\n', 'message')
             self.chat_text.tag_config('timestamp', foreground=t['accent_4'], font=('Consolas', 8))
-            self.chat_text.tag_config('message', foreground=t['chat_fg'], font=('Segoe UI', 10))
-
+            self.chat_text.tag_config('message',   foreground=t['chat_fg'],  font=('Segoe UI', 10))
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
 
@@ -1608,8 +1474,7 @@ class HavenClient:
         self.chat_text.insert(tk.END, f'[{timestamp}] ', 'sys_time')
         self.chat_text.insert(tk.END, f'{text}\n', 'system')
         self.chat_text.tag_config('sys_time', foreground=t['accent_4'], font=('Consolas', 8))
-        self.chat_text.tag_config('system', foreground=t['system_msg_color'],
-                                  font=('Segoe UI', 10, 'italic'))
+        self.chat_text.tag_config('system',   foreground=t['system_msg_color'], font=('Segoe UI', 10, 'italic'))
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
 
@@ -1617,14 +1482,11 @@ class HavenClient:
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
         self.speaker_labels.clear()
-
         for user_data in users_with_colors:
             self.user_colors[user_data['username']] = user_data.get('color', self.theme['accent_2'])
-
         for username, color in self.user_colors.items():
             if any(u['username'] == username for u in users_with_colors):
                 self.add_user_to_list(username, color)
-
         if self.username not in self.user_colors:
             self.user_colors[self.username] = self.name_color
 
@@ -1646,27 +1508,20 @@ class HavenClient:
             prefix = "🔴" if username in self.active_speakers else "●"
             self.speaker_labels[username].config(fg=new_color, text=f"{prefix} {username}")
         if username == self.username:
-            self.name_color = new_color
-            self.server_assigned_color = new_color
-            self.save_config()
-            self.display_system_message("✓ Your name color updated")
+            self.name_color = new_color; self.server_assigned_color = new_color
+            self.save_config(); self.display_system_message("✓ Your name color updated")
 
     def set_user_voice_active(self, username, active):
-        if active:
-            self.active_speakers.add(username)
-        else:
-            self.active_speakers.discard(username)
-
+        if active: self.active_speakers.add(username)
+        else:      self.active_speakers.discard(username)
         if username in self.speaker_labels:
             label      = self.speaker_labels[username]
             user_color = self.user_colors.get(username, self.theme['fg_color'])
             if active:
-                label.config(fg=user_color, font=('Segoe UI', 10, 'bold'),
-                             text=f"🔴 {username}")
+                label.config(fg=user_color, font=('Segoe UI', 10, 'bold'), text=f"🔴 {username}")
                 self.pulse_speaker(label, username)
             else:
-                label.config(fg=user_color, font=('Segoe UI', 10),
-                             text=f"● {username}")
+                label.config(fg=user_color, font=('Segoe UI', 10), text=f"● {username}")
 
     def pulse_speaker(self, label, username):
         if username in self.active_speakers and label.winfo_exists():
@@ -1689,40 +1544,31 @@ class HavenClient:
         new_name = dialog.result
         if new_name and new_name != self.username:
             try:
-                self.tcp_sock.send((json.dumps({
-                    'type': 'change_username',
-                    'new_username': new_name,
-                    'user_color': self.name_color
-                }) + '\n').encode())
-            except:
-                messagebox.showerror("Error", "Failed to change username")
+                self.tcp_sock.send((json.dumps({'type': 'change_username',
+                                                'new_username': new_name,
+                                                'user_color': self.name_color}) + '\n').encode())
+            except: messagebox.showerror("Error", "Failed to change username")
 
     def change_name_color(self):
         dialog = ColorPickerDialog(self.root, self.name_color, theme=self.theme)
         self.root.wait_window(dialog)
         if dialog.result and dialog.result != self.name_color:
-            old_color = self.name_color
-            self.name_color = dialog.result
+            old_color = self.name_color; self.name_color = dialog.result
             try:
-                self.tcp_sock.send((json.dumps({
-                    'type': 'change_username',
-                    'new_username': self.username,
-                    'user_color': self.name_color
-                }) + '\n').encode())
+                self.tcp_sock.send((json.dumps({'type': 'change_username',
+                                                'new_username': self.username,
+                                                'user_color': self.name_color}) + '\n').encode())
             except:
                 messagebox.showerror("Error", "Failed to update color")
-                self.name_color = old_color
-                return
+                self.name_color = old_color; return
             self.save_config()
 
     def change_ptt_key(self):
         dialog = KeybindDialog(self.root, self.ptt_key, theme=self.theme)
         self.root.wait_window(dialog)
         if dialog.result and dialog.result != self.ptt_key:
-            if hasattr(self, 'keyboard_listener'):
-                self.keyboard_listener.stop()
-            if hasattr(self, 'mouse_listener'):
-                self.mouse_listener.stop()
+            if hasattr(self, 'keyboard_listener'): self.keyboard_listener.stop()
+            if hasattr(self, 'mouse_listener'):    self.mouse_listener.stop()
             self.ptt_key = dialog.result
             self.setup_global_hotkey()
             self.update_voice_button_text()
@@ -1746,72 +1592,50 @@ class HavenClient:
     def restart_audio_streams(self):
         for stream in [self.stream_in, self.stream_out]:
             if stream:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except:
-                    pass
-        self.stream_in  = None
-        self.stream_out = None
+                try: stream.stop_stream(); stream.close()
+                except: pass
+        self.stream_in = None; self.stream_out = None
 
     def clear_saved_password(self):
-        self.saved_password = None
-        self.save_config()
+        self.saved_password = None; self.save_config()
         messagebox.showinfo("Password Cleared", "Saved password has been cleared.")
 
     # ── Voice ────────────────────────────────────────────────────
 
     def start_voice(self, event=None):
-        if self.voice_active or not self.authenticated:
-            return
+        if self.voice_active or not self.authenticated: return
         self.voice_active = True
-        self.voice_btn.config(bg=self.theme['voice_active_bg'],
-                              fg=self.theme['voice_active_fg'],
+        self.voice_btn.config(bg=self.theme['voice_active_bg'], fg=self.theme['voice_active_fg'],
                               text="🔴 TRANSMITTING...")
-        try:
-            self.tcp_sock.send((json.dumps({'type': 'voice_start'}) + '\n').encode())
-        except:
-            pass
-
+        try: self.tcp_sock.send((json.dumps({'type': 'voice_start'}) + '\n').encode())
+        except: pass
         if self.stream_in is None:
             try:
                 device_index = self.audio_settings.get('input_device_index', None)
-                opened = False
-                last_error = None
+                opened = False; last_error = None
                 for rate in SUPPORTED_RATES:
                     try:
-                        self.stream_in = self.p.open(
-                            format=FORMAT, channels=CHANNELS, rate=rate,
-                            input=True, input_device_index=device_index,
-                            frames_per_buffer=CHUNK)
-                        self.current_input_rate = rate
-                        opened = True
-                        break
-                    except Exception as e:
-                        last_error = e
-                if not opened:
-                    raise Exception(f"Failed to open mic. Last error: {last_error}")
+                        self.stream_in = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
+                                                      input=True, input_device_index=device_index,
+                                                      frames_per_buffer=CHUNK)
+                        self.current_input_rate = rate; opened = True; break
+                    except Exception as e: last_error = e
+                if not opened: raise Exception(f"Failed to open mic. Last error: {last_error}")
             except Exception as e:
                 messagebox.showerror("Audio Error", f"Failed to open microphone: {str(e)}")
                 self.voice_active = False
-                self.voice_btn.config(bg=self.theme['voice_idle_bg'],
-                                      fg=self.theme['voice_idle_fg'],
+                self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
                                       text=self.voice_btn_text)
                 return
-
         threading.Thread(target=self.send_audio, daemon=True).start()
 
     def stop_voice(self, event=None):
-        if not self.voice_active:
-            return
+        if not self.voice_active: return
         self.voice_active = False
-        self.voice_btn.config(bg=self.theme['voice_idle_bg'],
-                              fg=self.theme['voice_idle_fg'],
+        self.voice_btn.config(bg=self.theme['voice_idle_bg'], fg=self.theme['voice_idle_fg'],
                               text=self.voice_btn_text)
-        try:
-            self.tcp_sock.send((json.dumps({'type': 'voice_stop'}) + '\n').encode())
-        except:
-            pass
+        try: self.tcp_sock.send((json.dumps({'type': 'voice_stop'}) + '\n').encode())
+        except: pass
 
     def send_audio(self):
         while self.voice_active and self.running:
@@ -1823,46 +1647,41 @@ class HavenClient:
                         import numpy as np
                         audio_data = np.frombuffer(data, dtype=np.int16)
                         data = (audio_data * volume).astype(np.int16).tobytes()
-                    except ImportError:
-                        pass
+                    except ImportError: pass
                 self.udp_sock.sendto(data, (self.server_ip, SERVER_UDP_PORT))
-            except Exception as e:
-                print(f"Error sending audio: {e}")
-                break
+            except Exception as e: print(f"Error sending audio: {e}"); break
 
     # ── Cleanup ──────────────────────────────────────────────────
 
     def on_close(self):
-        if self._closing:
-            return
+        if self._closing: return
         self._closing = True
         self.running  = False
+
+        # Stop the tray icon first so it doesn't linger
+        if self.tray_icon:
+            try: self.tray_icon.stop()
+            except: pass
 
         for attr in ('keyboard_listener', 'mouse_listener'):
             listener = getattr(self, attr, None)
             if listener:
-                listener.stop()
+                try: listener.stop()
+                except: pass
 
         for stream in [getattr(self, 'stream_in', None), getattr(self, 'stream_out', None)]:
             if stream:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except:
-                    pass
+                try: stream.stop_stream(); stream.close()
+                except: pass
 
         if hasattr(self, 'p'):
-            try:
-                self.p.terminate()
-            except:
-                pass
+            try: self.p.terminate()
+            except: pass
 
         for sock in [getattr(self, 'tcp_sock', None), getattr(self, 'udp_sock', None)]:
             if sock:
-                try:
-                    sock.close()
-                except:
-                    pass
+                try: sock.close()
+                except: pass
 
         self.root.destroy()
 
