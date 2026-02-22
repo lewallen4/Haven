@@ -26,9 +26,22 @@ except ImportError:
 SERVER_TCP_PORT = 5000
 SERVER_UDP_PORT = 5001
 CONFIG_FILE = 'haven_config.json'
-THEMES_DIR  = 'themes'
-ICON_FILE   = os.path.join(THEMES_DIR, 'haven.ico')
 MAX_TCP_BUFFER = 65536
+# -----------------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PyInstaller resource path helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and PyInstaller --onefile."""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath('.'), relative_path)
+
+THEMES_DIR = resource_path('themes')
+ICON_FILE  = os.path.join(THEMES_DIR, 'haven.ico')
+
 # -----------------------------------
 
 # Audio settings
@@ -199,9 +212,9 @@ class LoginScreen(tk.Toplevel):
 
         tk.Frame(self, bg=self.t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
 
-        tk.Label(self, text="🌐 HAVEN CHAT", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
+        tk.Label(self, text="🌐 HAVEN", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
                  font=('Segoe UI', 22, 'bold')).pack(pady=(25, 5))
-        tk.Label(self, text="Enter connection details", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
+        tk.Label(self, text="Welcome Home", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
                  font=('Segoe UI', 10)).pack(pady=(0, 20))
 
         self.error_var = tk.StringVar(value=error_msg or '')
@@ -450,7 +463,7 @@ class KeybindDialog(tk.Toplevel):
         custom_frame.pack(pady=10)
         tk.Label(custom_frame, text="CUSTOM KEY/BUTTON:", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 9, 'bold')).pack(pady=(0, 10))
-        self.listen_btn = tk.Button(custom_frame, text="🎯 Click to Capture",
+        self.listen_btn = tk.Button(custom_frame, text="Click to Capture",
                                     bg=self.t['accent_3'], fg='#fff',
                                     font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
                                     command=self.start_listening, padx=20, pady=12, cursor='hand2',
@@ -460,7 +473,7 @@ class KeybindDialog(tk.Toplevel):
                                       bg=self.t['glass_bg'], fg=self.t['accent_4'],
                                       font=('Segoe UI', 9, 'italic'))
         self.capture_label.pack(pady=5)
-        tk.Button(self, text="Cancel", bg=self.t['accent_2'], fg='#fff',
+        tk.Button(self, text="Return", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
                   command=self.destroy, padx=20, pady=8, cursor='hand2').pack(pady=15)
         self.kb_listener = None; self.mouse_listener = None
