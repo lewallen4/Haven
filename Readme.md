@@ -65,13 +65,13 @@ cd haven-chat
 
 #### Windows
 ```bash
-pip install pyaudio numpy
+pip install pyaudio pynput pystray pillow
 ```
 
 #### Linux (Ubuntu/Debian)
 ```bash
 sudo apt-get install python3-pyaudio portaudio19-dev
-pip install pyaudio numpy
+pip install pyaudio pynput pystray pillow
 ```
 
 ---
