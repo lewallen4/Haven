@@ -89,7 +89,7 @@ pip install pyaudio pynput pystray pillow argon2-cffi
 
 2. **Admin console commands**:
    ```
-   /kick <username>      - Kick a user from the server
+   /kick <username>     - Kick a user from the server
    /ban <IP>            - Ban an IP address
    /unban <IP>          - Remove an IP from ban list
    /password <newpass>  - Change server password
