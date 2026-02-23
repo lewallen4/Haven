@@ -65,13 +65,13 @@ cd haven-chat
 
 #### Windows
 ```bash
-pip install pyaudio pynput pystray pillow
+pip install pyaudio pynput pystray pillow argon2-cffi
 ```
 
 #### Linux (Ubuntu/Debian)
 ```bash
 sudo apt-get install python3-pyaudio portaudio19-dev
-pip install pyaudio pynput pystray pillow
+pip install pyaudio pynput pystray pillow argon2-cffi
 ```
 
 ---
