@@ -86,7 +86,6 @@ try:
         CRYPTO_AVAILABLE, ARGON2_AVAILABLE as _ARGON2,
     )
     HAVEN_CRYPTO = True
-    print(f"  ✓ haven_crypto loaded (cryptography={'yes' if CRYPTO_AVAILABLE else 'stdlib'}, argon2={'yes' if _ARGON2 else 'no'})")
 except ImportError as e:
     HAVEN_CRYPTO = False
     # No silent fallback — encryption is mandatory.
@@ -751,14 +750,13 @@ class ModernInputDialog(tk.Toplevel):
     A fully themed input dialog that replaces simpledialog.Dialog.
     Supports custom titlebar (no feather), haven.ico, and theme colors.
     """
-    def __init__(self, parent, title, prompt, theme=None, show='', default=''):
+    def __init__(self, parent, title, prompt, theme=None, show='', default='', app=None):
         super().__init__(parent)
         self.result = None
         self.t = theme or _fallback_theme()
+        self._app = app  # HavenClient ref, used to hide embedded chat widgets
 
-        self.configure(bg=self.t['glass_bg'],
-                       highlightthickness=2,
-                       highlightbackground=self.t['accent_1'])
+        self.configure(bg=self.t['titlebar_sep'])   # 1px border via bg colour
         self.resizable(False, False)
         self.overrideredirect(True)
         self.geometry("400x220")
@@ -770,13 +768,22 @@ class ModernInputDialog(tk.Toplevel):
         self.grab_set()
         apply_window_icon(self)
 
-        build_themed_titlebar(self, self.t, title)
+        # Hide embedded chat frames so they don't paint over this dialog on Windows
+        if self._app:
+            self._app._hide_embedded_chat_widgets()
+        self.bind('<Destroy>', self._on_dialog_destroy)
 
-        tk.Label(self, text=prompt, bg=self.t['glass_bg'], fg=self.t['fg_color'],
+        # Inner content frame — same outer-border pattern as all other themed dialogs
+        _inner = tk.Frame(self, bg=self.t['glass_bg'])
+        _inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        build_themed_titlebar(_inner, self.t, title)
+
+        tk.Label(_inner, text=prompt, bg=self.t['glass_bg'], fg=self.t['fg_color'],
                  font=('Segoe UI', 11)).pack(padx=30, pady=(20, 10))
 
-        entry_frame = tk.Frame(self, bg=self.t['glass_accent'], highlightthickness=2,
-                               highlightbackground=self.t['accent_1'])
+        entry_frame = tk.Frame(_inner, bg=self.t['glass_accent'], highlightthickness=1,
+                               highlightbackground=self.t['titlebar_sep'])
         entry_frame.pack(fill=tk.X, padx=30)
 
         self.entry = tk.Entry(entry_frame, bg=self.t['glass_accent'], fg=self.t['fg_color'],
@@ -786,7 +793,7 @@ class ModernInputDialog(tk.Toplevel):
         if default:
             self.entry.insert(0, default)
 
-        btn_frame = tk.Frame(self, bg=self.t['glass_bg'])
+        btn_frame = tk.Frame(_inner, bg=self.t['glass_bg'])
         btn_frame.pack(pady=20)
 
         tk.Button(btn_frame, text="OK", bg=self.t['accent_1'], fg=self.t['send_btn_fg'],
@@ -799,6 +806,12 @@ class ModernInputDialog(tk.Toplevel):
         self.entry.bind('<Return>', lambda e: self._ok())
         self.entry.bind('<Escape>', lambda e: self.destroy())
         self.entry.focus_set()
+
+    def _on_dialog_destroy(self, event=None):
+        if event and event.widget is not self:
+            return  # only fire for this toplevel, not child widgets
+        if self._app:
+            self._app._show_embedded_chat_widgets()
 
     def _ok(self):
         self.result = self.entry.get()
@@ -1005,12 +1018,16 @@ class AudioDeviceDialog(tk.Toplevel):
                      command=lambda v, l=lbl, dv=var: (l.config(text=f"{int(dv.get())}%"),
                                                         callback())).pack(fill=tk.X, padx=10, pady=(0, 15))
 
+        UNCHANGED = '— Leave Unchanged —'
         in_frame = section("INPUT DEVICE (Microphone)")
-        self.input_var = tk.StringVar(value=self.result.get('input_device') or
-                                      (self.input_devices[0] if self.input_devices else "Default"))
+        self.input_devices.insert(0, UNCHANGED)
+        self.input_var = tk.StringVar(value=UNCHANGED)
         in_combo = ttk.Combobox(in_frame, textvariable=self.input_var,
                                 values=self.input_devices, state='readonly', width=50)
         in_combo.pack(padx=10, pady=5); self.style_combobox(in_combo)
+        in_combo.current(0)
+        in_combo.bind('<<ComboboxSelected>>',
+                      lambda e: self.result.update({'input_device': self.input_var.get()}))
         self.input_volume = tk.DoubleVar(value=self.result.get('input_volume', 100))
         vol_row(in_frame, "Input Volume", self.input_volume,
                 lambda: self.result.update({'input_volume': self.input_volume.get()}))
@@ -1019,11 +1036,14 @@ class AudioDeviceDialog(tk.Toplevel):
                   padx=15, pady=5, cursor='hand2').pack(pady=(0, 15))
 
         out_frame = section("OUTPUT DEVICE (Speakers/Headphones)")
-        self.output_var = tk.StringVar(value=self.result.get('output_device') or
-                                       (self.output_devices[0] if self.output_devices else "Default"))
+        self.output_devices.insert(0, UNCHANGED)
+        self.output_var = tk.StringVar(value=UNCHANGED)
         out_combo = ttk.Combobox(out_frame, textvariable=self.output_var,
                                  values=self.output_devices, state='readonly', width=50)
         out_combo.pack(padx=10, pady=5); self.style_combobox(out_combo)
+        out_combo.current(0)
+        out_combo.bind('<<ComboboxSelected>>',
+                       lambda e: self.result.update({'output_device': self.output_var.get()}))
         self.output_volume = tk.DoubleVar(value=self.result.get('output_volume', 100))
         vol_row(out_frame, "Output Volume", self.output_volume,
                 lambda: self.result.update({'output_volume': self.output_volume.get()}))
@@ -1078,20 +1098,35 @@ class AudioDeviceDialog(tk.Toplevel):
             option add *TCombobox*Listbox.selectForeground {sel_fg}
         ''')
 
+    def _find_device_str(self, device_list, saved_index):
+        """Find the display string in device_list that matches a saved device index.
+        Falls back to the first entry (Default) if no match found."""
+        if saved_index is not None:
+            target = f"Device {saved_index}:"
+            for entry in device_list:
+                if entry.startswith(target):
+                    return entry
+        return device_list[0] if device_list else "Default"
+
     def get_audio_devices(self):
+        # Default entries
         try:
             self.input_devices.append(f"Default ({self.p.get_default_input_device_info()['name']})")
         except: self.input_devices.append("Default")
         try:
             self.output_devices.append(f"Default ({self.p.get_default_output_device_info()['name']})")
         except: self.output_devices.append("Default")
+
         for i in range(self.p.get_device_count()):
             try:
                 d = self.p.get_device_info_by_index(i)
+                name = d['name'].strip()
+                # Input-only list: devices that have input channels
                 if d['maxInputChannels'] > 0:
-                    self.input_devices.append(f"Device {i}: {d['name']}")
+                    self.input_devices.append(f"Device {i}: {name}")
+                # Output-only list: devices that have output channels
                 if d['maxOutputChannels'] > 0:
-                    self.output_devices.append(f"Device {i}: {d['name']}")
+                    self.output_devices.append(f"Device {i}: {name}")
             except: continue
 
     def test_input_device(self):
@@ -1184,22 +1219,29 @@ class AudioDeviceDialog(tk.Toplevel):
             messagebox.showerror("Test Failed", f"Could not test speakers: {str(e)}")
 
     def save_settings(self):
-        self.result['input_device']  = self.input_var.get()
-        self.result['output_device'] = self.output_var.get()
+        UNCHANGED = '— Leave Unchanged —'
         self.result['input_volume']  = self.input_volume.get()
         self.result['output_volume'] = self.output_volume.get()
 
-        # Resolve device index from the display string ("Device N: Name" or "Default (...)")
-        for device_key, index_key in (('input_device', 'input_device_index'),
-                                       ('output_device', 'output_device_index')):
-            device_str = self.result[device_key]
-            if device_str and not device_str.startswith("Default"):
-                try:
-                    self.result[index_key] = int(device_str.split("Device ")[1].split(":")[0])
-                except (IndexError, ValueError):
-                    self.result[index_key] = None
+        # Only commit device selections that the user explicitly changed
+        for device_key, index_key, var in (
+            ('input_device',  'input_device_index',  self.input_var),
+            ('output_device', 'output_device_index', self.output_var),
+        ):
+            chosen = var.get()
+            if chosen == UNCHANGED:
+                pass   # keep whatever was already in self.result from current_settings
+            elif chosen.startswith("Default"):
+                self.result[device_key]  = chosen
+                self.result[index_key]   = None
             else:
-                self.result[index_key] = None
+                try:
+                    idx = int(chosen.split("Device ")[1].split(":")[0].strip())
+                    self.result[device_key] = chosen
+                    self.result[index_key]  = idx
+                except (IndexError, ValueError):
+                    self.result[device_key] = chosen
+                    self.result[index_key]  = None
         self.destroy()
 
 
@@ -1427,6 +1469,8 @@ class HavenClient:
         self.root.after(100, lambda: self.root.attributes('-topmost', False))
 
     def minimize_to_tray(self):
+        # Only hide the window — do NOT touch self.running or the TCP connection.
+        # The server keeps the user in the userlist; they remain fully online.
         self.root.withdraw()
 
     # ── Theme ────────────────────────────────────────────────────
@@ -1621,7 +1665,6 @@ class HavenClient:
                             self.server_assigned_color = msg['user_color']
                             self.name_color = msg['user_color']
                         crypto_info = msg.get('crypto', {})
-                        print(f"  ✓ E2E encryption active: {crypto_info.get('kem','?')} / {crypto_info.get('chat_enc','?')}")
                         return 'ok'
                     elif msg['type'] == 'auth_failed':
                         tcp_sock.close(); udp_sock.close(); return 'auth_failed'
@@ -1822,9 +1865,10 @@ class HavenClient:
 
         # Open Mic toggle — compact, sits to the left of PTT
         om_bg  = t['voice_active_bg'] if self.open_mic_active else t['voice_idle_bg']
+        om_fg  = t['voice_active_fg'] if self.open_mic_active else t['voice_idle_fg']
         om_txt = "🔴 MIC ON" if self.open_mic_active else "🎙 OPEN MIC"
         self.open_mic_btn = tk.Button(voice_inner, text=om_txt,
-                                      bg=om_bg, fg=t['voice_idle_fg'],
+                                      bg=om_bg, fg=om_fg,
                                       font=('Segoe UI', 9, 'bold'), relief=tk.FLAT,
                                       cursor='hand2', activebackground=t['voice_active_bg'],
                                       bd=0, padx=10, pady=10,
@@ -2162,7 +2206,7 @@ class HavenClient:
         if self.open_mic_active:
             self.open_mic_active = False
             if self.open_mic_btn:
-                self.open_mic_btn.config(text="🎙 OPEN MIC", bg=t['voice_idle_bg'])
+                self.open_mic_btn.config(text="🎙 OPEN MIC", bg=t['voice_idle_bg'], fg=t['voice_idle_fg'])
             self.voice_active = False
             if self.voice_btn:
                 self.voice_btn.config(bg=t['voice_idle_bg'], fg=t['voice_idle_fg'],
@@ -2172,7 +2216,7 @@ class HavenClient:
         else:
             self.open_mic_active = True
             if self.open_mic_btn:
-                self.open_mic_btn.config(text="🔴 MIC ON", bg=t['voice_active_bg'])
+                self.open_mic_btn.config(text="🔴 MIC ON", bg=t['voice_active_bg'], fg=t['voice_active_fg'])
             self.start_voice()
 
     # ── Low-level chat render helpers ────────────────────────────
@@ -2689,7 +2733,7 @@ class HavenClient:
             self.apply_theme(dialog.result)
 
     def change_username(self):
-        dialog = ModernInputDialog(self.root, "Change Username", "Enter new username:", theme=self.theme)
+        dialog = ModernInputDialog(self.root, "Change Username", "Enter new username:", theme=self.theme, app=self)
         self.root.wait_window(dialog)
         new_name = dialog.result
         if new_name and new_name.strip() and new_name.strip() != self.username:
@@ -2726,6 +2770,35 @@ class HavenClient:
             self.save_config()
             self.display_system_message(
                 f"✓ Push-to-talk key changed to {self.format_key_display(dialog.result)}")
+
+    def _get_embedded_chat_widgets(self):
+        """Return all tk.Frame widgets embedded in the chat text widget."""
+        widgets = []
+        try:
+            # dump returns all embedded windows as a flat list of (key, value, index) tuples
+            dump = self.chat_text.dump('1.0', tk.END, window=True)
+            for key, value, idx in dump:
+                if key == 'window' and value:
+                    try:
+                        w = self.chat_text.nametowidget(value)
+                        widgets.append(w)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return widgets
+
+    def _hide_embedded_chat_widgets(self):
+        """Lower all embedded chat frames so dialogs paint over them correctly."""
+        for w in self._get_embedded_chat_widgets():
+            try: w.lower()
+            except: pass
+
+    def _show_embedded_chat_widgets(self):
+        """Restore embedded chat frames to normal stacking order."""
+        for w in self._get_embedded_chat_widgets():
+            try: w.lift()
+            except: pass
 
     def configure_audio_devices(self):
         dialog = AudioDeviceDialog(self.root, self.p, self.audio_settings, theme=self.theme)
