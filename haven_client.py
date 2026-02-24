@@ -36,13 +36,18 @@ from pynput import keyboard, mouse
 # Build command (from root/):
 #   pyinstaller --onefile --noconsole --icon=themes/haven.ico \
 #       --add-data "themes;themes" \
-#       --add-data "bin/haven_crypto.py;." \
+#       --paths "bin" \
+#       --hidden-import haven_crypto \
 #       --name Haven haven_client.py
 #
 # Notes:
-#   • --add-data "themes;themes"           bundles the whole themes/ folder
-#   • --add-data "bin/haven_crypto.py;."   drops crypto module flat into _MEIPASS
-#     (resource_path and the sys.path insert both handle _MEIPASS correctly)
+#   • --add-data "themes;themes"   bundles the whole themes/ folder
+#   • --paths "bin"                tells PyInstaller to look in bin/ for modules
+#                                  so haven_crypto is collected as a real .pyc,
+#                                  not a raw data file (avoids crypto mismatch bugs)
+#   • --hidden-import haven_crypto explicitly collects it even with --onefile
+#   • DO NOT use --add-data for haven_crypto.py — data files bypass PyInstaller's
+#     module collection and can cause CRYPTO_AVAILABLE to differ between instances
 #   • haven_config.json is written next to the .exe at runtime — not bundled
 #   • The server/ folder is never part of the client build
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -69,7 +74,13 @@ except ImportError:
 # ── PQ Hybrid Crypto ──────────────────────────────────────────────────────────
 # Add bin/ directory to path so haven_crypto.py can be found in both dev and
 # PyInstaller --onefile mode (where _MEIPASS flattens all files together).
-if not getattr(sys, 'frozen', False):
+# Ensure haven_crypto.py is findable both in dev (bin/) and frozen (_MEIPASS)
+if getattr(sys, 'frozen', False):
+    # PyInstaller: _MEIPASS already in sys.path; haven_crypto.py bundled there
+    _meipass = getattr(sys, '_MEIPASS', '')
+    if _meipass and _meipass not in sys.path:
+        sys.path.insert(0, _meipass)
+else:
     _bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
     if _bin_dir not in sys.path:
         sys.path.insert(0, _bin_dir)
@@ -86,6 +97,13 @@ try:
         CRYPTO_AVAILABLE, ARGON2_AVAILABLE as _ARGON2,
     )
     HAVEN_CRYPTO = True
+    _frozen = getattr(sys, 'frozen', False)
+    if _frozen and not CRYPTO_AVAILABLE:
+        import tkinter.messagebox as _mb
+        _mb.showerror("Encryption Error",
+            "The cryptography library failed to load in the packaged exe.\n\n"
+            "Messages will fail to decrypt on the server.\n\n"
+            "Please report this build issue.")
 except ImportError as e:
     HAVEN_CRYPTO = False
     # No silent fallback — encryption is mandatory.
