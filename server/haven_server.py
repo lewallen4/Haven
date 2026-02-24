@@ -35,7 +35,6 @@ try:
         SessionCrypto, CRYPTO_AVAILABLE, ARGON2_AVAILABLE
     )
     HAVEN_CRYPTO = True
-    print(f"  ✓ haven_crypto loaded  (cryptography={'yes' if CRYPTO_AVAILABLE else 'no'}, argon2={'yes' if ARGON2_AVAILABLE else 'no'})")
 except ImportError as e:
     HAVEN_CRYPTO = False
     print(f"\n  ✗ FATAL: haven_crypto not found — {e}")
@@ -142,15 +141,20 @@ def load_or_create_config():
             with open(SERVER_CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             stored = config.get('password_hash', '')
+            wire   = config.get('password_wire_hash', '')
             if stored:
                 # Upgrade bare SHA-256 hashes from old config files
                 if not any(stored.startswith(p) for p in ('argon2:', 'pbkdf2:', 'sha256:')):
-                    # Raw hex — wrap it
                     stored = 'sha256:' + stored
                     _upgrade_config_hash(stored)
                 SERVER_PASSWORD_HASH = stored
                 algo = 'Argon2id' if stored.startswith('argon2:') else ('PBKDF2' if stored.startswith('pbkdf2:') else 'SHA-256 (legacy)')
-                print(f"  ✓ Config loaded. Password algo: {algo}")
+                if wire:
+                    # Wire hash already saved — no interactive prompt needed at startup
+                    _SERVER_AUTH_CACHE['wire_response'] = wire
+                    print(f"  ✓ Config loaded. Password algo: {algo}. Wire auth ready.")
+                else:
+                    print(f"  ✓ Config loaded. Password algo: {algo}.")
                 return
         except Exception as e:
             print(f"  ⚠ Could not read config: {e}")
@@ -171,6 +175,8 @@ def load_or_create_config():
         break
 
     SERVER_PASSWORD_HASH = hash_password(password)
+    # Cache wire hash immediately so save_config() persists it — no prompt on next start
+    _SERVER_AUTH_CACHE['wire_response'] = hashlib.sha256(password.encode()).hexdigest()
     save_config()
     print(f"\n  ✓ Password hashed with {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256'} and saved.\n")
 
@@ -183,8 +189,15 @@ def _upgrade_config_hash(new_hash):
 
 def save_config():
     try:
+        data = {'password_hash': SERVER_PASSWORD_HASH}
+        # Also persist the wire hash so startup needs no interactive prompt.
+        # Wire hash = SHA256(password). Safe to store server-side: it only
+        # authenticates to this server and is useless without TLS+PQ layer.
+        wire = _SERVER_AUTH_CACHE.get('wire_response', '')
+        if wire:
+            data['password_wire_hash'] = wire
         with open(SERVER_CONFIG_FILE, 'w') as f:
-            json.dump({'password_hash': SERVER_PASSWORD_HASH}, f, indent=2)
+            json.dump(data, f, indent=2)
     except Exception as e:
         print(f"⚠ Could not save config: {e}")
 
@@ -693,24 +706,26 @@ def udp_server():
 _SERVER_AUTH_CACHE = {}
 
 def _setup_wire_auth():
-    """Ask for the password once at startup to populate the wire auth cache."""
-    global SERVER_PASSWORD_HASH
-    # If we just set the password (first run), we already have it in plaintext via getpass.
-    # For subsequent runs we need to ask once more to get wire hash.
-    # We store it only in memory.
+    """Ensure wire auth cache is populated. Prompts only if wire hash not already saved."""
+    # Wire hash already loaded from config by load_or_create_config — nothing to do.
+    if _SERVER_AUTH_CACHE.get('wire_response'):
+        return True
+
+    # Wire hash not in config (old install or first run after upgrade).
+    # Ask once, then save it so future startups are prompt-free.
     if os.path.exists(SERVER_CONFIG_FILE):
         try:
             with open(SERVER_CONFIG_FILE, 'r') as f:
                 stored = json.load(f).get('password_hash', '')
             if stored:
-                # Need plaintext to compute wire hash
-                pw = getpass.getpass("  Enter server password to start: ")
+                pw = getpass.getpass("  Enter server password (one-time — will be cached): ")
                 if not verify_password(pw, stored):
                     print("  ✗ Wrong password.")
                     sys.exit(1)
                 wire_hash = hashlib.sha256(pw.encode()).hexdigest()
                 _SERVER_AUTH_CACHE['wire_response'] = wire_hash
-                print("  ✓ Wire auth key loaded (memory only, not stored).")
+                save_config()   # persist wire hash so next start needs no prompt
+                print("  ✓ Wire auth cached. Future startups will not require a password prompt.")
                 return True
         except Exception as e:
             print(f"  ✗ Error: {e}")
@@ -792,8 +807,9 @@ def admin_console():
                 save_config()
                 wire_hash = hashlib.sha256(pw.encode()).hexdigest()
                 _SERVER_AUTH_CACHE['wire_response'] = wire_hash
+                save_config()   # persist new wire hash
                 log_action('Admin changed server password')
-                print('  ✓ Password updated. Existing sessions remain active.')
+                print('  ✓ Password updated and cached. Existing sessions remain active.')
             except Exception as e:
                 print(f'  ✗ Error: {e}')
 
@@ -859,9 +875,11 @@ def admin_console():
 # ---------- Entry Point ----------
 
 if __name__ == '__main__':
-    print("\n" + "⚡"*30)
-    print("       HAVEN CHAT SERVER  (PQ Secure Edition)")
-    print("⚡"*30 + "\n")
+    print("\n" + "="*60)
+    print(" ")
+    print("       HAVEN CHAT SERVER")
+    print("\n" + "="*60)
+    print(" ")
 
     load_or_create_config()
 
@@ -881,8 +899,6 @@ if __name__ == '__main__':
     threading.Thread(target=udp_server,    daemon=True).start()
     threading.Thread(target=admin_console, daemon=True).start()
 
-    print("  Server running. Type /help for admin commands.")
-    print(f"  Encryption: PQ Hybrid (Kyber-512 + X25519 + AES-256-GCM + ChaCha20-Poly1305)")
-    print()
+    
     while True:
         time.sleep(1)
