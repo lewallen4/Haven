@@ -16,7 +16,6 @@ import subprocess
 from collections import defaultdict, deque
 
 # ── Crypto module ─────────────────────────────────────────────────────────────
-# haven_crypto.py lives in ../bin/ relative to this server script.
 import sys, os as _os
 _bin_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'bin')
 if _bin_dir not in sys.path:
@@ -47,7 +46,6 @@ TCP_HOST = '0.0.0.0'
 TCP_PORT = 5000
 UDP_HOST = '0.0.0.0'
 UDP_PORT = 5001
-# All server data files live alongside haven_server.py in the server/ directory.
 _SERVER_DIR        = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE           = os.path.join(_SERVER_DIR, 'server.log')
 CHAT_HISTORY_FILE  = os.path.join(_SERVER_DIR, 'chat_history.json')
@@ -59,12 +57,12 @@ MAX_HISTORY_MESSAGES = 1000
 # Security limits
 MAX_CONNECTIONS        = 100
 MAX_CONNECTIONS_PER_IP = 3
-LOGIN_TIMEOUT          = 20   # slightly more for crypto handshake
+LOGIN_TIMEOUT          = 20
 RECV_TIMEOUT           = 300
-MAX_BUFFER_SIZE        = 131072   # 128KB (larger for encrypted payloads)
+MAX_BUFFER_SIZE        = 131072
 MAX_MESSAGE_LENGTH     = 4000
 MAX_USERNAME_LENGTH    = 32
-UDP_RATE_LIMIT         = 80        # slightly higher — encrypted packets are larger
+UDP_RATE_LIMIT         = 80
 UDP_RATE_WINDOW        = 1.0
 
 BANNED_IPS = set()
@@ -79,8 +77,6 @@ USER_COLOR_PALETTE = [
     '#f72585', '#b5179e', '#7209b7', '#560bad'
 ]
 
-# Connected clients:
-# {username: {tcp, addr, udp_port, authenticated, color, session: SessionCrypto|None}}
 clients      = {}
 clients_lock = threading.Lock()
 
@@ -88,14 +84,21 @@ active_connections  = 0
 connections_by_ip   = defaultdict(int)
 connections_lock    = threading.Lock()
 
-active_speakers = set()
+active_speakers      = set()
+active_speakers_lock = threading.Lock()   # FIX: was unprotected
 chat_history    = deque(maxlen=MAX_HISTORY_MESSAGES)
 history_lock    = threading.Lock()
 
 udp_rate_tracker = defaultdict(deque)
 udp_rate_lock    = threading.Lock()
 
-# Per-IP session keys for voice decryption (keyed by (ip, udp_port))
+_AUTH_FAIL_WINDOW   = 600
+_AUTH_FAIL_MAX      = 5
+_AUTH_LOCKOUT_TIME  = 1800
+_auth_failures      = defaultdict(deque)
+_auth_lockouts      = {}
+_auth_lock          = threading.Lock()
+
 voice_sessions      = {}
 voice_sessions_lock = threading.Lock()
 
@@ -119,7 +122,6 @@ def generate_self_signed_cert():
 
 def ensure_tls_cert():
     if os.path.exists(TLS_CERT_FILE) and os.path.exists(TLS_KEY_FILE):
-        print(f"  ✓ Found existing TLS certificate")
         return True
     return generate_self_signed_cert()
 
@@ -127,7 +129,6 @@ def create_ssl_context():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    # Prefer forward-secret cipher suites
     ctx.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
     return ctx
 
@@ -143,18 +144,13 @@ def load_or_create_config():
             stored = config.get('password_hash', '')
             wire   = config.get('password_wire_hash', '')
             if stored:
-                # Upgrade bare SHA-256 hashes from old config files
                 if not any(stored.startswith(p) for p in ('argon2:', 'pbkdf2:', 'sha256:')):
                     stored = 'sha256:' + stored
                     _upgrade_config_hash(stored)
                 SERVER_PASSWORD_HASH = stored
                 algo = 'Argon2id' if stored.startswith('argon2:') else ('PBKDF2' if stored.startswith('pbkdf2:') else 'SHA-256 (legacy)')
                 if wire:
-                    # Wire hash already saved — no interactive prompt needed at startup
                     _SERVER_AUTH_CACHE['wire_response'] = wire
-                    print(f"  ✓ Config loaded. Password algo: {algo}. Wire auth ready.")
-                else:
-                    print(f"  ✓ Config loaded. Password algo: {algo}.")
                 return
         except Exception as e:
             print(f"  ⚠ Could not read config: {e}")
@@ -175,13 +171,11 @@ def load_or_create_config():
         break
 
     SERVER_PASSWORD_HASH = hash_password(password)
-    # Cache wire hash immediately so save_config() persists it — no prompt on next start
     _SERVER_AUTH_CACHE['wire_response'] = hashlib.sha256(password.encode()).hexdigest()
     save_config()
     print(f"\n  ✓ Password hashed with {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256'} and saved.\n")
 
 def _upgrade_config_hash(new_hash):
-    """Rewrite config with upgraded hash format."""
     global SERVER_PASSWORD_HASH
     SERVER_PASSWORD_HASH = new_hash
     save_config()
@@ -190,9 +184,6 @@ def _upgrade_config_hash(new_hash):
 def save_config():
     try:
         data = {'password_hash': SERVER_PASSWORD_HASH}
-        # Also persist the wire hash so startup needs no interactive prompt.
-        # Wire hash = SHA256(password). Safe to store server-side: it only
-        # authenticates to this server and is useless without TLS+PQ layer.
         wire = _SERVER_AUTH_CACHE.get('wire_response', '')
         if wire:
             data['password_wire_hash'] = wire
@@ -243,13 +234,117 @@ def sanitize_username(username):
     import re
     return re.sub(r'[^\w\-]', '', username)[:MAX_USERNAME_LENGTH]
 
+def _history_key():
+    """Derive the history encryption key from the wire hash in memory."""
+    wire = _SERVER_AUTH_CACHE.get('wire_response', '')
+    if not wire:
+        return None
+    return _hmac.new(wire.encode(), b'history-encryption-key-v1', hashlib.sha256).digest()
+
+# ---------- History Encryption (AES-256-GCM direct, no haven_crypto API) ------
+# We use the cryptography library directly rather than encrypt_message() to
+# avoid any ambiguity about that function's key format or return type.
+
+def _encrypt_history(data_bytes: bytes, key: bytes) -> bytes:
+    """
+    AES-256-GCM encrypt with a random 12-byte nonce.
+    Layout: 0x02 | nonce(12) | ciphertext+tag(len+16)
+    Falls back to SHAKE256-CTR+HMAC if cryptography lib unavailable.
+    """
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        nonce = os.urandom(12)
+        ct = AESGCM(key[:32]).encrypt(nonce, data_bytes, None)
+        return b'\x02' + nonce + ct
+    except ImportError:
+        # SHAKE256-CTR + HMAC-SHA256 stdlib fallback
+        nonce = os.urandom(12)
+        h = hashlib.shake_256()
+        h.update(key + nonce + b'history-ctr')
+        ks = h.digest(len(data_bytes))
+        ct = bytes(a ^ b for a, b in zip(data_bytes, ks))
+        tag_key = _hmac.new(key, b'history-tag-' + nonce, hashlib.sha256).digest()
+        tag = _hmac.new(tag_key, ct, hashlib.sha256).digest()
+        return b'\x01' + nonce + tag + ct
+
+def _decrypt_history(enc_bytes: bytes, key: bytes):
+    """Returns decrypted bytes or None on auth/format failure."""
+    if not enc_bytes:
+        return None
+
+    version = enc_bytes[0]
+
+    if version == 0x02:
+        # AES-256-GCM direct
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            nonce = enc_bytes[1:13]
+            ct    = enc_bytes[13:]
+            return AESGCM(key[:32]).decrypt(nonce, ct, None)
+        except Exception:
+            return None
+
+    elif version == 0x01:
+        # Legacy SHAKE256-CTR — reads fine, re-saves as 0x02 on next write
+        payload = enc_bytes[1:]
+        if len(payload) < 44:
+            return None
+        nonce = payload[:12]
+        tag   = payload[12:44]
+        ct    = payload[44:]
+        tag_key = _hmac.new(key, b'history-tag-' + nonce, hashlib.sha256).digest()
+        expected = _hmac.new(tag_key, ct, hashlib.sha256).digest()
+        if not _hmac.compare_digest(tag, expected):
+            return None
+        h = hashlib.shake_256()
+        h.update(key + nonce + b'history-ctr')
+        ks = h.digest(len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks))
+
+    else:
+        # Pre-versioned legacy format — try SHAKE256-CTR without version byte
+        payload = enc_bytes
+        if len(payload) < 44:
+            return None
+        nonce = payload[:12]
+        tag   = payload[12:44]
+        ct    = payload[44:]
+        tag_key = _hmac.new(key, b'history-tag-' + nonce, hashlib.sha256).digest()
+        expected = _hmac.new(tag_key, ct, hashlib.sha256).digest()
+        if not _hmac.compare_digest(tag, expected):
+            return None
+        h = hashlib.shake_256()
+        h.update(key + nonce + b'history-ctr')
+        ks = h.digest(len(ct))
+        return bytes(a ^ b for a, b in zip(ct, ks))
+
 def load_chat_history():
+    key = _history_key()
     try:
         with open(CHAT_HISTORY_FILE, 'r') as f:
-            data = json.load(f)
+            wrapper = json.load(f)
+
+        if isinstance(wrapper, list):
+            # Legacy plaintext format — migrate to encrypted on next save
+            data = wrapper
+            log_action(f'Loaded {len(data)} messages (plaintext — will encrypt on next save)')
+        elif wrapper.get('v') == 1:
+            if key is None:
+                log_action('Cannot decrypt history — wire key not available')
+                return
+            enc_bytes = base64.b64decode(wrapper['data'])
+            pt = _decrypt_history(enc_bytes, key)
+            if pt is None:
+                log_action('Chat history decryption failed — wrong key or file corrupt')
+                return
+            data = json.loads(pt.decode('utf-8'))
+            log_action(f'Loaded {len(data)} messages (encrypted)')
+        else:
+            log_action('Unknown history format — skipping')
+            return
+
         with history_lock:
             chat_history.extend(data)
-        log_action(f'Loaded {len(data)} messages from chat history')
     except FileNotFoundError:
         log_action('No existing chat history, starting fresh')
     except Exception as e:
@@ -259,8 +354,16 @@ def save_chat_history():
     try:
         with history_lock:
             data = list(chat_history)
+        payload = json.dumps(data).encode('utf-8')
+        key = _history_key()
+        if key:
+            enc = _encrypt_history(payload, key)
+            wrapper = {'v': 1, 'data': base64.b64encode(enc).decode('ascii')}
+        else:
+            log_action('Warning: saving chat history unencrypted (no key)')
+            wrapper = data
         with open(CHAT_HISTORY_FILE, 'w') as f:
-            json.dump(data, f)
+            json.dump(wrapper, f)
     except Exception as e:
         log_action(f'Error saving chat history: {e}')
 
@@ -276,9 +379,12 @@ def add_to_history(user, text):
 
 def log_action(action):
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with open(LOG_FILE, 'a') as f:
-        f.write(f'[{ts}] {action}\n')
-    print(f'[LOG] {action}')
+    safe_action = action.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+    with open(LOG_FILE, 'a', encoding='utf-8', errors='replace') as f:
+        f.write(f'[{ts}] {safe_action}\n')
+    console_enc = sys.stdout.encoding or 'utf-8'
+    console_safe = safe_action.encode(console_enc, errors='replace').decode(console_enc, errors='replace')
+    print(f'[LOG] {console_safe}')
 
 def send_json(conn, obj):
     conn.send((json.dumps(obj) + '\n').encode())
@@ -301,24 +407,53 @@ def broadcast_full_userlist():
         ]
     broadcast_tcp({'type': 'userlist_full', 'users': user_list})
 
+# ---------- FIX: History sent encrypted per-recipient -------------------------
+
 def send_chat_history(conn, session):
-    """Send chat history — messages are server-side plaintext (history predates this session)."""
+    """
+    Send chat history encrypted with the recipient's session key.
+    Each message is individually encrypted so the wire format matches live
+    broadcast messages — no plaintext history ever leaves the server.
+
+    If session is None (shouldn't happen — server rejects clients without one)
+    we do NOT send history at all rather than leaking it in plaintext.
+    """
+    if session is None:
+        log_action('Skipping history send — no session (would be plaintext)')
+        return
     try:
         with history_lock:
             history_data = list(chat_history)
-        if history_data:
-            send_json(conn, {'type': 'chat_history', 'history': history_data})
-            log_action(f'Sent {len(history_data)} history messages')
+        if not history_data:
+            return
+
+        encrypted_history = []
+        for entry in history_data:
+            plaintext = entry.get('text', '')
+            try:
+                ct = session.encrypt_chat(plaintext)
+                encrypted_history.append({
+                    'user':      entry.get('user', ''),
+                    'timestamp': entry.get('timestamp', ''),
+                    'color':     entry.get('color'),
+                    'encrypted': True,
+                    'ct':        ct,
+                })
+            except Exception as e:
+                # Skip messages that fail to encrypt rather than sending plaintext
+                log_action(f'History entry encryption failed, skipping: {e}')
+                continue
+
+        if encrypted_history:
+            send_json(conn, {'type': 'chat_history', 'history': encrypted_history})
+            log_action(f'Sent {len(encrypted_history)} history messages (encrypted)')
     except Exception as e:
         log_action(f'Failed to send chat history: {e}')
 
-# ---------- Encrypted broadcast ----------
+# ---------- Encrypted broadcast -----------------------------------------------
 
 def broadcast_encrypted_chat(sender_username, plaintext, exclude_conn=None):
-    """
-    Broadcast a chat message encrypted per-recipient with their session key.
-    Each client gets a ciphertext only they can decrypt.
-    """
+    """Broadcast a chat message encrypted per-recipient with their session key."""
     with clients_lock:
         targets = [
             (u, i) for u, i in clients.items()
@@ -332,22 +467,15 @@ def broadcast_encrypted_chat(sender_username, plaintext, exclude_conn=None):
                 ct = session.encrypt_chat(plaintext)
                 msg = {'type': 'chat', 'user': sender_username, 'encrypted': True, 'ct': ct}
             else:
-                # No session means the client never completed PQ handshake.
-                # We do not send plaintext — skip this recipient entirely.
                 log_action(f"Skipping unencrypted relay to {uname} (no session)")
                 continue
             info['tcp'].send((json.dumps(msg) + '\n').encode())
         except: pass
 
-# ---------- Auth Handshake ----------
+# ---------- Auth Handshake ----------------------------------------------------
 
 def do_server_handshake(conn, addr):
-    """
-    Perform the PQ hybrid handshake and return (nonce, SessionCrypto) on success,
-    or raise an exception on failure.
-    """
     nonce = secrets.token_hex(32)
-
     if HAVEN_CRYPTO:
         kyber_pk, kyber_sk = generate_kyber_keypair()
         x25519_priv, x25519_pub = generate_x25519_keypair()
@@ -355,25 +483,47 @@ def do_server_handshake(conn, addr):
     else:
         hello = {'type': 'challenge', 'nonce': nonce}
         kyber_sk = x25519_priv = None
-
     send_json(conn, hello)
     return nonce, kyber_sk, x25519_priv
 
 def finalize_session_crypto(kyber_sk, x25519_priv, nonce, client_hello_msg):
-    """Derive session key from client hello. Returns SessionCrypto or None."""
     if not HAVEN_CRYPTO or not kyber_sk:
         return None
     try:
         kyber_ct, client_x25519_pub = unpack_client_hello(client_hello_msg)
-        kyber_ss   = kyber_decapsulate(kyber_sk, kyber_ct)
-        ecdh_ss    = x25519_exchange(x25519_priv, client_x25519_pub)
+        kyber_ss    = kyber_decapsulate(kyber_sk, kyber_ct)
+        ecdh_ss     = x25519_exchange(x25519_priv, client_x25519_pub)
         session_key = derive_session_key(kyber_ss, ecdh_ss, nonce)
         return SessionCrypto(session_key)
     except Exception as e:
         log_action(f'Crypto handshake error: {e}')
         return None
 
-# ---------- TCP Client Handler ----------
+# ---------- Auth failure tracking ---------------------------------------------
+
+def _record_auth_failure(ip):
+    now = time.time()
+    with _auth_lock:
+        failures = _auth_failures[ip]
+        while failures and now - failures[0] > _AUTH_FAIL_WINDOW:
+            failures.popleft()
+        failures.append(now)
+        if len(failures) >= _AUTH_FAIL_MAX:
+            _auth_lockouts[ip] = now + _AUTH_LOCKOUT_TIME
+            log_action(f'Auth lockout: {ip} after {len(failures)} failures — blocked for {_AUTH_LOCKOUT_TIME//60}min')
+            return True
+    return False
+
+def _is_auth_locked(ip):
+    with _auth_lock:
+        expiry = _auth_lockouts.get(ip)
+        if expiry and time.time() < expiry:
+            return True
+        elif expiry:
+            del _auth_lockouts[ip]
+    return False
+
+# ---------- TCP Client Handler ------------------------------------------------
 
 def handle_tcp_client(conn, addr):
     username = None
@@ -381,6 +531,12 @@ def handle_tcp_client(conn, addr):
     authenticated = False
     ip = addr[0]
     session = None
+
+    if _is_auth_locked(ip):
+        log_action(f'Rejected locked-out IP: {ip}')
+        try: conn.close()
+        except: pass
+        return
 
     with connections_lock:
         global active_connections
@@ -394,7 +550,6 @@ def handle_tcp_client(conn, addr):
 
         conn.settimeout(LOGIN_TIMEOUT)
 
-        # ── PQ Hybrid Handshake ──────────────────────────────────────────────
         nonce, kyber_sk, x25519_priv = do_server_handshake(conn, addr)
 
         while True:
@@ -424,31 +579,22 @@ def handle_tcp_client(conn, addr):
 
                 mtype = msg.get('type', '')
 
-                # ── Login ────────────────────────────────────────────────────
                 if mtype == 'login':
                     provided = msg.get('auth_response', '')
-                    wire_hash = SERVER_PASSWORD_HASH
-                    # Server always stores strong hash (argon2/pbkdf2),
-                    # but wire auth uses SHA256(nonce:SHA256(password)).
-                    # We need the wire_hash of the password, which is SHA256(password).
-                    # We can't reverse our storage hash, so we store the wire_hash separately
-                    # in memory only (set at startup) — see SERVER_WIRE_HASH global.
                     expected = _SERVER_AUTH_CACHE.get('wire_response', '')
                     if not expected:
-                        # Fallback: if no wire response cached (shouldn't happen)
                         log_action(f'Auth cache miss from {ip}')
                         send_json(conn, {'type': 'auth_failed'})
                         return
 
-                    # Compute expected: SHA256(nonce:wire_hash)
                     expected_response = hashlib.sha256(f"{nonce}:{expected}".encode()).hexdigest()
 
                     if not _hmac.compare_digest(provided, expected_response):
                         send_json(conn, {'type': 'auth_failed'})
-                        log_action(f'Failed auth from {ip} (user: {msg.get("username","?")}) ')
+                        log_action(f'Failed auth from {ip} (user: {msg.get("username","?")})')
+                        _record_auth_failure(ip)
                         return
 
-                    # ── Session crypto ───────────────────────────────────────
                     session = finalize_session_crypto(kyber_sk, x25519_priv, nonce, msg)
                     if HAVEN_CRYPTO and session is None:
                         log_action(f'Crypto handshake failed for {ip}, rejecting')
@@ -474,10 +620,10 @@ def handle_tcp_client(conn, addr):
                             'authenticated': True,
                             'color': user_color,
                             'session': session,
+                            'last_seen': time.time(),
                         }
                         authenticated = True
 
-                    # Store voice key for UDP routing
                     if session:
                         with voice_sessions_lock:
                             voice_sessions[(ip, udp_port)] = session.voice_key
@@ -494,7 +640,11 @@ def handle_tcp_client(conn, addr):
                     send_json(conn, {'type': 'auth_ok', 'user_color': user_color,
                                      'crypto': crypto_info})
                     log_action(f'User {username} joined from {ip} | crypto={crypto_info["enabled"]} kem={crypto_info["kem"]}')
+                    with _auth_lock:
+                        _auth_failures.pop(ip, None)
+                        _auth_lockouts.pop(ip, None)
 
+                    # History sent encrypted — session is passed in
                     send_chat_history(conn, session)
 
                     with clients_lock:
@@ -511,7 +661,11 @@ def handle_tcp_client(conn, addr):
                 if not authenticated:
                     continue
 
-                # ── Chat ──────────────────────────────────────────────────────
+                if username:
+                    with clients_lock:
+                        if username in clients:
+                            clients[username]['last_seen'] = time.time()
+
                 if mtype == 'chat':
                     if msg.get('encrypted') and session:
                         plaintext = session.decrypt_chat(msg.get('ct', ''))
@@ -519,12 +673,9 @@ def handle_tcp_client(conn, addr):
                             log_action(f'Decryption failed from {username} — message dropped')
                             continue
                     elif session:
-                        # Session active but message arrived unencrypted — reject it.
                         log_action(f'Unencrypted message from {username} rejected (session active)')
                         continue
                     else:
-                        # No session and no encryption — should never reach here
-                        # since we reject clients that fail PQ handshake at login.
                         log_action(f'Unexpected unencrypted message from {username} — dropped')
                         continue
                     plaintext = plaintext[:MAX_MESSAGE_LENGTH]
@@ -533,18 +684,31 @@ def handle_tcp_client(conn, addr):
                         broadcast_encrypted_chat(username, plaintext, exclude_conn=conn)
                         add_to_history(username, plaintext)
 
-                # ── Voice ─────────────────────────────────────────────────────
+                elif mtype == 'ping':
+                    try:
+                        send_json(conn, {'type': 'pong'})
+                    except: pass
+                    continue
+
+                elif mtype == 'pong':
+                    if username:
+                        with clients_lock:
+                            if username in clients:
+                                clients[username]['last_seen'] = time.time()
+                    continue
+
                 elif mtype == 'voice_start':
                     if username:
-                        active_speakers.add(username)
+                        with active_speakers_lock:
+                            active_speakers.add(username)
                         broadcast_tcp({'type': 'voice_start', 'user': username})
 
                 elif mtype == 'voice_stop':
                     if username:
-                        active_speakers.discard(username)
+                        with active_speakers_lock:
+                            active_speakers.discard(username)
                         broadcast_tcp({'type': 'voice_stop', 'user': username})
 
-                # ── Change Username ───────────────────────────────────────────
                 elif mtype == 'change_username':
                     new_raw  = msg.get('new_username', '').strip()
                     new_name = sanitize_username(new_raw)
@@ -564,9 +728,10 @@ def handle_tcp_client(conn, addr):
                             clients[new_name] = clients.pop(username)
                             clients[new_name]['tcp'] = conn
                             username = new_name
-                            if old_username in active_speakers:
-                                active_speakers.discard(old_username)
-                                active_speakers.add(new_name)
+                            with active_speakers_lock:
+                                if old_username in active_speakers:
+                                    active_speakers.discard(old_username)
+                                    active_speakers.add(new_name)
 
                         clients[username]['color'] = new_color if new_color else current_color
 
@@ -604,7 +769,8 @@ def handle_tcp_client(conn, addr):
             if udp_port:
                 with voice_sessions_lock:
                     voice_sessions.pop((ip, udp_port), None)
-            active_speakers.discard(username)
+            with active_speakers_lock:
+                active_speakers.discard(username)
             log_action(f'User {username} disconnected')
             broadcast_full_userlist()
             leave_text = f'{username} has left the chat'
@@ -612,7 +778,46 @@ def handle_tcp_client(conn, addr):
             add_to_history('System', leave_text)
         conn.close()
 
-# ---------- TCP Server ----------
+# ---------- Server Heartbeat --------------------------------------------------
+
+HEARTBEAT_INTERVAL = 300
+HEARTBEAT_TIMEOUT  = 60
+
+def server_heartbeat():
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL)
+        now      = time.time()
+        deadline = now - HEARTBEAT_INTERVAL - HEARTBEAT_TIMEOUT
+
+        dead_users = []
+        with clients_lock:
+            for uname, info in clients.items():
+                if not info.get('authenticated'):
+                    continue
+                last_seen = info.get('last_seen', now)
+                if last_seen < deadline:
+                    dead_users.append(uname)
+                else:
+                    try:
+                        send_json(info['tcp'], {'type': 'ping'})
+                    except Exception:
+                        dead_users.append(uname)
+
+        for uname in dead_users:
+            log_action(f'Heartbeat timeout — removing {uname}')
+            with clients_lock:
+                info = clients.pop(uname, {})
+            if info:
+                try: info['tcp'].close()
+                except: pass
+            with active_speakers_lock:
+                active_speakers.discard(uname)
+            broadcast_full_userlist()
+            leave_text = f'{uname} has left the chat'
+            broadcast_encrypted_chat('System', leave_text)
+            add_to_history('System', leave_text)
+
+# ---------- TCP Server --------------------------------------------------------
 
 def tcp_server():
     ssl_ctx = create_ssl_context()
@@ -636,7 +841,7 @@ def tcp_server():
                 except Exception as e:
                     log_action(f'TCP accept error: {e}')
 
-# ---------- UDP Voice Server (with per-session encryption) ----------
+# ---------- UDP Voice Server --------------------------------------------------
 
 def udp_check_rate_limit(ip):
     now = time.monotonic()
@@ -677,12 +882,11 @@ def udp_server():
                     if i.get('authenticated') and u != sender
                 ]
 
-            # Decrypt from sender, re-encrypt for each recipient
             if HAVEN_CRYPTO and sender_info.get('session'):
                 sender_session = sender_info['session']
                 pcm = sender_session.decrypt_voice(data)
                 if pcm is None:
-                    continue  # Drop invalid/tampered packet
+                    continue
 
                 for uname, info in recipients:
                     recv_session = info.get('session')
@@ -692,27 +896,19 @@ def udp_server():
                             udp_sock.sendto(enc, (info['addr'][0], info['udp_port']))
                         except: pass
             else:
-                # Sender has no session — drop the packet.
-                # We never relay unencrypted voice when encryption is expected.
                 pass
 
         except Exception as e:
             log_action(f'UDP error: {e}')
 
-# ---------- Wire Password Cache ----------
-# We store the strong hash (Argon2/PBKDF2) on disk.
-# For wire auth we need SHA256(password) in memory — obtained once at startup.
-# This never touches disk.
+# ---------- Wire Password Cache -----------------------------------------------
+
 _SERVER_AUTH_CACHE = {}
 
 def _setup_wire_auth():
-    """Ensure wire auth cache is populated. Prompts only if wire hash not already saved."""
-    # Wire hash already loaded from config by load_or_create_config — nothing to do.
     if _SERVER_AUTH_CACHE.get('wire_response'):
         return True
 
-    # Wire hash not in config (old install or first run after upgrade).
-    # Ask once, then save it so future startups are prompt-free.
     if os.path.exists(SERVER_CONFIG_FILE):
         try:
             with open(SERVER_CONFIG_FILE, 'r') as f:
@@ -724,7 +920,7 @@ def _setup_wire_auth():
                     sys.exit(1)
                 wire_hash = hashlib.sha256(pw.encode()).hexdigest()
                 _SERVER_AUTH_CACHE['wire_response'] = wire_hash
-                save_config()   # persist wire hash so next start needs no prompt
+                save_config()
                 print("  ✓ Wire auth cached. Future startups will not require a password prompt.")
                 return True
         except Exception as e:
@@ -732,7 +928,7 @@ def _setup_wire_auth():
             sys.exit(1)
     return False
 
-# ---------- Admin Console ----------
+# ---------- Admin Console -----------------------------------------------------
 
 def admin_console():
     print("\n" + "="*60)
@@ -766,7 +962,8 @@ def admin_console():
                         clients[username]['tcp'].close()
                     except: pass
                     del clients[username]
-                    active_speakers.discard(username)
+                    with active_speakers_lock:
+                        active_speakers.discard(username)
                     log_action(f'Admin kicked {username} ({ip})')
                     broadcast_full_userlist()
                     print(f'  ✓ Kicked {username}')
@@ -782,7 +979,9 @@ def admin_console():
                         clients[uname]['tcp'].send(json.dumps({'type': 'banned'}).encode() + b'\n')
                         clients[uname]['tcp'].close()
                     except: pass
-                    del clients[uname]; active_speakers.discard(uname)
+                    del clients[uname]
+                    with active_speakers_lock:
+                        active_speakers.discard(uname)
             log_action(f'Admin banned {ip}'); broadcast_full_userlist()
             print(f'  ✓ Banned {ip}')
 
@@ -804,10 +1003,9 @@ def admin_console():
                     print("  ✗ Mismatch"); continue
                 global SERVER_PASSWORD_HASH
                 SERVER_PASSWORD_HASH = hash_password(pw)
-                save_config()
                 wire_hash = hashlib.sha256(pw.encode()).hexdigest()
                 _SERVER_AUTH_CACHE['wire_response'] = wire_hash
-                save_config()   # persist new wire hash
+                save_config()
                 log_action('Admin changed server password')
                 print('  ✓ Password updated and cached. Existing sessions remain active.')
             except Exception as e:
@@ -822,6 +1020,8 @@ def admin_console():
                 print(f"  KEM                 : Kyber-512 + X25519 (hybrid PQ)")
                 print(f"  Chat encryption     : {'AES-256-GCM' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC-SHA256'}")
                 print(f"  Voice encryption    : {'ChaCha20-Poly1305' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC-SHA256'}")
+                print(f"  History delivery    : encrypted per-recipient (AES-256-GCM)")
+                print(f"  History storage     : {'AES-256-GCM' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC (legacy)'}")
                 print(f"  Password KDF        : {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256 (600k)'}")
                 with clients_lock:
                     encrypted_users = sum(1 for i in clients.values() if i.get('session'))
@@ -836,7 +1036,9 @@ def admin_console():
                 print(f'\n  {"Username":<20} {"IP":<16} {"Crypto":<8} {"Voice"}')
                 print('  ' + '-'*56)
                 for uname, info in authed.items():
-                    voice  = '🔴 live' if uname in active_speakers else '○ idle'
+                    with active_speakers_lock:
+                        speaking = uname in active_speakers
+                    voice  = '🔴 live' if speaking else '○ idle'
                     crypto = 'E2E' if info.get('session') else 'plain'
                     print(f'  {uname:<20} {info["addr"][0]:<16} {crypto:<8} {voice}')
                 print()
@@ -866,25 +1068,20 @@ def admin_console():
             save_chat_history(); print('  ✓ Saved')
 
         elif cmd == '/help':
-            admin_console.__doc__ and print(admin_console.__doc__)
             print("  /kick /ban /unban /password /list /history /stats /crypto /save /help")
 
         else:
             if cmd: print('  ✗ Unknown command. /help for help.')
 
-# ---------- Entry Point ----------
+# ---------- Entry Point -------------------------------------------------------
 
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print(" ")
-    print("       HAVEN CHAT SERVER")
-    print("\n" + "="*60)
-    print(" ")
+    print("  HAVEN CHAT SERVER  (PQ Secure Edition)")
+    print("="*60 + "\n")
 
     load_or_create_config()
 
-    # After config is loaded / created, set up the wire auth cache
-    # (first-run path doesn't need to re-prompt — handled differently)
     if os.path.exists(SERVER_CONFIG_FILE) and not _SERVER_AUTH_CACHE.get('wire_response'):
         _setup_wire_auth()
 
@@ -895,10 +1092,12 @@ if __name__ == '__main__':
     print_network_info()
     load_chat_history()
 
-    threading.Thread(target=tcp_server,    daemon=True).start()
-    threading.Thread(target=udp_server,    daemon=True).start()
-    threading.Thread(target=admin_console, daemon=True).start()
+    threading.Thread(target=tcp_server,        daemon=True).start()
+    threading.Thread(target=udp_server,        daemon=True).start()
+    threading.Thread(target=admin_console,     daemon=True).start()
+    threading.Thread(target=server_heartbeat,  daemon=True).start()
 
-    
+    print("  Server running. Type /help for admin commands.")
+    print()
     while True:
         time.sleep(1)
