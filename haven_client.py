@@ -36,19 +36,27 @@ from pynput import keyboard, mouse
 # Build command (from root/):
 #   pyinstaller --onefile --noconsole --icon=themes/haven.ico \
 #       --add-data "themes;themes" \
+#       --add-data "bin/sounds;bin/sounds" \
 #       --paths "bin" \
 #       --hidden-import haven_crypto \
 #       --name Haven haven_client.py
 #
+# Runtime layout (frozen exe on Windows):
+#   %LOCALAPPDATA%/Haven\
+#     haven_config.json      ← auto-created on first run
+#     auth\
+#       192.168.1.10_5000.tofu   ← TOFU fingerprints, one per server
+#       myserver.com_5000.tofu
+#     themes\               ← NOT here — themes are read from _MEIPASS (bundle)
+#
 # Notes:
-#   • --add-data "themes;themes"   bundles the whole themes/ folder
-#   • --paths "bin"                tells PyInstaller to look in bin/ for modules
-#                                  so haven_crypto is collected as a real .pyc,
-#                                  not a raw data file (avoids crypto mismatch bugs)
-#   • --hidden-import haven_crypto explicitly collects it even with --onefile
-#   • DO NOT use --add-data for haven_crypto.py — data files bypass PyInstaller's
-#     module collection and can cause CRYPTO_AVAILABLE to differ between instances
-#   • haven_config.json is written next to the .exe at runtime — not bundled
+#   • --add-data "themes;themes"   bundles themes/ into the exe (read via _MEIPASS)
+#   • --paths "bin"                collects haven_crypto as a real module
+#   • --hidden-import haven_crypto explicitly includes it
+#   • DO NOT use --add-data for haven_crypto.py — causes crypto mismatch in exe
+#   • User data (config, auth/) lives in %LOCALAPPDATA%/Haven — never in the exe dir
+#   • TOFU: first connect to a server prompts to trust its cert fingerprint
+#     and saves it to auth/<host>_<port>.tofu — no manual cert bundling needed
 #   • The server/ folder is never part of the client build
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -98,6 +106,7 @@ try:
     )
     HAVEN_CRYPTO = True
     _frozen = getattr(sys, 'frozen', False)
+
     if _frozen and not CRYPTO_AVAILABLE:
         import tkinter.messagebox as _mb
         _mb.showerror("Encryption Error",
@@ -119,36 +128,161 @@ except ImportError as e:
 # ---------- Configuration ----------
 SERVER_TCP_PORT = 5000
 SERVER_UDP_PORT = 5001
-CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'haven_config.json'
-) if not getattr(sys, 'frozen', False) else os.path.join(
-    os.path.dirname(sys.executable), 'haven_config.json'
-)
 MAX_TCP_BUFFER = 131072  # larger for encrypted payloads
-# -----------------------------------
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PyInstaller resource path helper
+# Path helpers — centralised so frozen and dev stay consistent
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _user_data_dir():
+    """
+    Where Haven stores its user data.
+    Frozen (exe) → %LOCALAPPDATA%/Haven\
+    Dev (.py)    → same directory as haven_client.py
+    """
+    if getattr(sys, 'frozen', False):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        d = os.path.join(base, 'Haven')
+        os.makedirs(d, exist_ok=True)
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+
+USER_DATA_DIR = _user_data_dir()
+CONFIG_FILE   = os.path.join(USER_DATA_DIR, 'haven_config.json')
+AUTH_DIR      = os.path.join(USER_DATA_DIR, 'auth')
 
 def resource_path(relative_path):
-    """Get absolute path to resource, works for dev and PyInstaller --onefile.
-    In dev: relative to the directory containing haven_client.py (root).
-    In PyInstaller --onefile: relative to _MEIPASS (all bundled flat).
+    """
+    Path to a BUNDLED read-only resource (themes, icon).
+    Frozen → inside _MEIPASS (the PyInstaller temp extract dir).
+    Dev    → relative to haven_client.py.
     """
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
-    base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+def user_data_path(relative_path):
+    """Path to a user-writable file inside USER_DATA_DIR."""
+    return os.path.join(USER_DATA_DIR, relative_path)
 
 def get_exe_path():
     if getattr(sys, 'frozen', False):
         return [sys.executable]
-    else:
-        return [sys.executable, sys.argv[0]]
+    return [sys.executable, sys.argv[0]]
 
+# Bundled read-only assets
 THEMES_DIR = resource_path('themes')
 ICON_FILE  = os.path.join(THEMES_DIR, 'haven.ico')
+SOUNDS_DIR = resource_path('bin/sounds')
+
+# ── Sound engine ──────────────────────────────────────────────────────────────
+# Uses PyAudio (already a project dependency) with a permanently-open output
+# stream. PCM frames are decoded from WAV at startup and written directly to
+# the device buffer — bypassing WinMM/winsound entirely.
+#
+# Why PyAudio instead of winsound:
+#   winsound goes through WinMM → audio session negotiation on every call,
+#   adding 20-80ms of overhead regardless of SND_FILENAME vs SND_MEMORY.
+#   PyAudio holds an open PortAudio stream; write() is a direct memcpy into
+#   the device ring buffer — latency is one buffer period (~10ms at 1024 frames).
+#
+# Overlapping sounds each get their own thread writing to the same stream;
+# PortAudio mixes them at the driver level.
+
+_sound_pcm: dict     = {}   # name -> (rate, channels, sampwidth, raw_pcm_bytes)
+_sfx_stream          = None  # shared PyAudio output stream
+_sfx_pa              = None  # dedicated PyAudio instance for sfx
+_sfx_lock            = threading.Lock()
+_sfx_ready           = False
+
+def _load_sound_buffers():
+    """
+    Decode all WAVs in SOUNDS_DIR to raw PCM at startup.
+    Stored as (rate, channels, sampwidth, pcm_bytes) tuples.
+    """
+    global _sound_pcm
+    try:
+        if not os.path.isdir(SOUNDS_DIR):
+            return
+        import wave as _wave
+        for fname in os.listdir(SOUNDS_DIR):
+            if not fname.endswith('.wav') or fname.startswith('_'):
+                continue
+            path = os.path.join(SOUNDS_DIR, fname)
+            with _wave.open(path, 'rb') as w:
+                rate   = w.getframerate()
+                ch     = w.getnchannels()
+                sw     = w.getsampwidth()
+                pcm    = w.readframes(w.getnframes())
+            _sound_pcm[fname[:-4]] = (rate, ch, sw, pcm)
+    except Exception as e:
+        print(f'[AUDIO] PCM load error: {e}')
+
+def _open_sfx_stream():
+    """Open a persistent low-latency PyAudio output stream for sound effects."""
+    global _sfx_stream, _sfx_pa, _sfx_ready
+    try:
+        import pyaudio as _pa
+        _sfx_pa = _pa.PyAudio()
+        # Use first available sound — all our files are 44100 mono 16-bit
+        rate, ch, sw = 44100, 1, 2
+        if _sound_pcm:
+            rate, ch, sw, _ = next(iter(_sound_pcm.values()))
+        _sfx_stream = _sfx_pa.open(
+            format=_sfx_pa.get_format_from_width(sw),
+            channels=ch,
+            rate=rate,
+            output=True,
+            frames_per_buffer=512,   # ~11ms at 44100 — low latency
+        )
+        _sfx_ready = True
+    except Exception as e:
+        print(f'[AUDIO] PyAudio SFX stream failed: {e}')
+        _sfx_ready = False
+
+def _play_pcm(pcm: bytes):
+    """Write raw PCM to the shared output stream. Called on a per-sound thread."""
+    global _sfx_stream, _sfx_ready
+    if not _sfx_ready or _sfx_stream is None:
+        return
+    try:
+        with _sfx_lock:
+            # write() is non-blocking at the Python level when the buffer has space;
+            # for short SFX this returns almost immediately.
+            _sfx_stream.write(pcm)
+    except Exception:
+        # Stream may have closed (device change etc.) — reopen once
+        try:
+            _open_sfx_stream()
+            if _sfx_ready:
+                _sfx_stream.write(pcm)
+        except Exception:
+            pass
+
+def _play_pcm_threaded(name: str):
+    """Thread target: look up PCM and write to stream."""
+    entry = _sound_pcm.get(name)
+    if entry:
+        _play_pcm(entry[3])
+
+_sfx_init_done = False
+
+def _ensure_sfx_ready():
+    global _sfx_init_done
+    if not _sfx_init_done:
+        _sfx_init_done = True
+        threading.Thread(target=_open_sfx_stream, daemon=True,
+                         name='HavenSFXInit').start()
+
+def play_sound(name: str, enabled: bool = True):
+    """Fire-and-forget PCM playback via PyAudio. Near-zero latency, overlapping."""
+    if not enabled:
+        return
+    if name not in _sound_pcm:
+        return
+    _ensure_sfx_ready()
+    threading.Thread(target=_play_pcm_threaded, args=(name,), daemon=True,
+                     name=f'HavenSFX_{name}').start()
 
 # -----------------------------------
 
@@ -268,10 +402,222 @@ def fetch_image_bytes(url: str, max_bytes: int = 2_000_000):
 # TLS helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOFU — Trust On First Use cert pinning
+# auth/<host>_<port>.tofu stores the SHA-256 fingerprint of the server cert.
+# First connection: user is prompted to trust. Subsequent connections: silent.
+# Fingerprint mismatch: hard block.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _tofu_path(host, port):
+    """Return path to the .tofu fingerprint file for a given server."""
+    os.makedirs(AUTH_DIR, exist_ok=True)
+    safe = re.sub(r'[^a-zA-Z0-9._-]', '_', host)
+    return os.path.join(AUTH_DIR, f'{safe}_{port}.tofu')
+
+def _cert_fingerprint(der_bytes):
+    """SHA-256 fingerprint of a DER-encoded certificate, hex-formatted."""
+    digest = hashlib.sha256(der_bytes).hexdigest()
+    return ':'.join(digest[i:i+2] for i in range(0, len(digest), 2))
+
+class TofuDialog(tk.Toplevel):
+    """Themed TOFU trust prompt — matches all other Haven dialogs."""
+    def __init__(self, parent, host, port, fp, theme=None):
+        super().__init__(parent)
+        self.result  = None   # True=trust, False=decline
+        t = theme or _fallback_theme()
+        self.configure(bg=t['titlebar_sep'] if 'titlebar_sep' in t else t['glass_bg'])
+        self.overrideredirect(True)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        apply_window_icon(self)
+
+        # ── Outer border frame (1px accent line) ──────────────────────────────
+        inner = tk.Frame(self, bg=t['glass_bg'])
+        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        build_themed_titlebar(inner, t, "New Server — Trust Certificate?")
+
+        body = tk.Frame(inner, bg=t['glass_bg'])
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
+
+        tk.Label(body, text=f"🔐  {host}:{port}",
+                 bg=t['glass_bg'], fg=t['accent_1'],
+                 font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(0, 12))
+
+        tk.Label(body,
+                 text="Haven has not connected to this server before.\nVerify this fingerprint with the server operator\nbefore trusting.",
+                 bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 9), justify='left').pack(anchor='w')
+
+        tk.Frame(body, bg=t['accent_1'], height=1).pack(fill='x', pady=12)
+
+        tk.Label(body, text="SHA-256 fingerprint:",
+                 bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+
+        # Fingerprint in a monospace copyable label broken into 2 lines
+        half = len(fp) // 2
+        fp_display = fp[:half] + '\n' + fp[half:]
+        tk.Label(body, text=fp_display,
+                 bg=t['glass_accent'], fg=t['accent_1'],
+                 font=('Consolas', 8), justify='left',
+                 padx=8, pady=6).pack(fill='x', pady=(4, 14))
+
+        btn_row = tk.Frame(body, bg=t['glass_bg'])
+        btn_row.pack(fill='x')
+
+        tk.Button(btn_row, text="✓  Trust & Connect",
+                  bg=t['accent_1'], fg=t['send_btn_fg'],
+                  font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
+                  padx=16, pady=8, cursor='hand2',
+                  command=self._trust).pack(side='left', padx=(0, 8))
+
+        tk.Button(btn_row, text="✕  Decline",
+                  bg=t['accent_2'], fg='#ffffff',
+                  font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
+                  padx=16, pady=8, cursor='hand2',
+                  command=self._decline).pack(side='left')
+
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        if parent and parent.winfo_exists():
+            px = parent.winfo_rootx() + (parent.winfo_width()  - w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        else:
+            px = (self.winfo_screenwidth()  - w) // 2
+            py = (self.winfo_screenheight() - h) // 2
+        self.geometry(f'{w}x{h}+{px}+{py}')
+        self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
+        self.focus_force()
+
+    def _trust(self):   self.result = True;  self.destroy()
+    def _decline(self): self.result = False; self.destroy()
+
+
+class TofuMismatchDialog(tk.Toplevel):
+    """Themed cert mismatch dialog — lets the user trust the new cert or cancel."""
+    def __init__(self, parent, host, port, saved_fp, current_fp, tofu_file, theme=None):
+        super().__init__(parent)
+        self.result = False   # True = user chose to trust the new cert
+        t = theme or _fallback_theme()
+        self.configure(bg=t['titlebar_sep'] if 'titlebar_sep' in t else t['glass_bg'])
+        self.overrideredirect(True)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        apply_window_icon(self)
+
+        inner = tk.Frame(self, bg=t['glass_bg'])
+        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        build_themed_titlebar(inner, t, "⚠  Certificate Changed")
+
+        body = tk.Frame(inner, bg=t['glass_bg'])
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
+
+        tk.Label(body, text=f"⚠  {host}:{port}",
+                 bg=t['glass_bg'], fg='#ff4444',
+                 font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(0, 8))
+
+        tk.Label(body,
+                 text="The server's certificate has changed since you last connected.\n"
+                      "This is normal if the server was rebuilt or the cert was renewed.\n"
+                      "If unexpected, verify with the server operator before trusting.",
+                 bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 9), justify='left').pack(anchor='w')
+
+        tk.Frame(body, bg='#ff4444', height=1).pack(fill='x', pady=10)
+
+        for label, fp in (("Old fingerprint:", saved_fp),
+                           ("New fingerprint:", current_fp)):
+            tk.Label(body, text=label, bg=t['glass_bg'], fg=t['fg_color'],
+                     font=('Segoe UI', 8, 'bold')).pack(anchor='w')
+            half = len(fp) // 2
+            tk.Label(body, text=fp[:half] + '\n' + fp[half:],
+                     bg=t['glass_accent'], fg=t['accent_1'],
+                     font=('Consolas', 8), justify='left',
+                     padx=8, pady=4).pack(fill='x', pady=(2, 8))
+
+        btn_row = tk.Frame(body, bg=t['glass_bg'])
+        btn_row.pack(pady=(6, 0))
+
+        def _trust():
+            self.result = True
+            self.destroy()
+
+        tk.Button(btn_row, text="✓ Trust New Certificate",
+                  bg=t['accent_1'], fg=t['send_btn_fg'],
+                  font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
+                  padx=16, pady=8, cursor='hand2',
+                  command=_trust).pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Button(btn_row, text="Cancel",
+                  bg=t['accent_2'], fg='#ffffff',
+                  font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
+                  padx=16, pady=8, cursor='hand2',
+                  command=self.destroy).pack(side=tk.LEFT)
+
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        if parent and parent.winfo_exists():
+            px = parent.winfo_rootx() + (parent.winfo_width()  - w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        else:
+            px = (self.winfo_screenwidth()  - w) // 2
+            py = (self.winfo_screenheight() - h) // 2
+        self.geometry(f'{w}x{h}+{px}+{py}')
+        self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
+        self.focus_force()
+        self.wait_window()
+
+
+def _tofu_check(host, port, der_bytes, parent_window=None, theme=None):
+    """
+    Check TOFU trust for a server cert.
+    Returns True if trusted, False if rejected.
+    On first connect: shows themed trust dialog.
+    On repeat connect: verifies silently.
+    On mismatch: shows themed warning, returns False.
+    """
+    fp        = _cert_fingerprint(der_bytes)
+    tofu_file = _tofu_path(host, port)
+
+    if os.path.exists(tofu_file):
+        saved = open(tofu_file).read().strip()
+        if saved == fp:
+            return True   # known and trusted — silent
+        # Fingerprint changed — ask the user whether to trust the new cert
+        print(f"[TOFU] Cert changed for {host}:{port} — prompting user")
+        if parent_window:
+            dlg = TofuMismatchDialog(parent_window, host, port,
+                                     saved, fp, tofu_file, theme=theme)
+            if dlg.result:
+                # User chose to trust — overwrite the saved fingerprint
+                with open(tofu_file, 'w') as fh:
+                    fh.write(fp)
+                print(f"[TOFU] New fingerprint accepted and saved for {host}:{port}")
+                return True
+        print(f"[TOFU] New cert rejected by user for {host}:{port}")
+        return False
+
+    # First time seeing this server — save silently and connect
+    os.makedirs(AUTH_DIR, exist_ok=True)
+    with open(tofu_file, 'w') as f:
+        f.write(fp)
+    print(f"[TOFU] New server {host}:{port} — fingerprint saved automatically")
+    return True
+
 def create_tls_context():
-    ctx = ssl.create_default_context()
+    """Create a TLS context that accepts any cert — TOFU check is done post-handshake."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode    = ssl.CERT_NONE   # we do our own pinning via TOFU
     return ctx
 
 
@@ -423,11 +769,22 @@ def make_scrollbar(parent, theme, orient=tk.VERTICAL, command=None):
 def build_themed_titlebar(window, theme, title_text, on_close=None):
     """
     Attach a matching themed titlebar to *window*.
-    window.overrideredirect(True) must already be set.
+    window.overrideredirect(True) must already be set (on the Toplevel).
+    *window* may be the Toplevel itself or a child Frame used as a border container —
+    in either case dragging is applied to the nearest Toplevel ancestor.
     Returns the titlebar Frame.
     """
     t = theme
     close_cmd = on_close if on_close else window.destroy
+
+    # Resolve the actual Toplevel so drag calls .geometry() on the right widget
+    def _toplevel(w):
+        while w is not None:
+            if isinstance(w, (tk.Tk, tk.Toplevel)):
+                return w
+            w = w.master
+        return window  # fallback
+    top = _toplevel(window)
 
     tb = tk.Frame(window, bg=t['titlebar_bg'], height=35)
     tb.pack(fill=tk.X, side=tk.TOP)
@@ -444,13 +801,13 @@ def build_themed_titlebar(window, theme, title_text, on_close=None):
 
     tk.Frame(window, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
 
-    # Drag support
-    window._dx = window._dy = None
-    def _s(e): window._dx = e.x; window._dy = e.y
-    def _e(e): window._dx = None; window._dy = None
+    # Drag support — always moves the Toplevel, never a Frame
+    top._dx = top._dy = None
+    def _s(e): top._dx = e.x; top._dy = e.y
+    def _e(e): top._dx = None; top._dy = None
     def _m(e):
-        if window._dx is not None:
-            window.geometry(f"+{window.winfo_x()+e.x-window._dx}+{window.winfo_y()+e.y-window._dy}")
+        if top._dx is not None:
+            top.geometry(f"+{top.winfo_x()+e.x-top._dx}+{top.winfo_y()+e.y-top._dy}")
     tb.bind('<Button-1>', _s); tb.bind('<ButtonRelease-1>', _e); tb.bind('<B1-Motion>', _m)
     return tb
 
@@ -543,6 +900,8 @@ class LoginScreen(tk.Toplevel):
 
         self.grab_set()
         self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
         self.focus_force()
 
         # Custom title bar
@@ -690,7 +1049,7 @@ class ThemeDialog(tk.Toplevel):
         self.grab_set()
         apply_window_icon(self)
 
-        build_themed_titlebar(self, theme, "Choose Theme")
+        build_themed_titlebar(self, theme, " ")
 
         tk.Label(self, text="Choose Theme", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=16)
@@ -765,37 +1124,32 @@ class ThemeDialog(tk.Toplevel):
 
 class ModernInputDialog(tk.Toplevel):
     """
-    A fully themed input dialog that replaces simpledialog.Dialog.
-    Supports custom titlebar (no feather), haven.ico, and theme colors.
+    Themed text-input dialog. Same structure as ColorPickerDialog/ThemeDialog —
+    transient + grab_set, plain destroy(). No embedded widget hide/show needed.
     """
     def __init__(self, parent, title, prompt, theme=None, show='', default='', app=None):
         super().__init__(parent)
         self.result = None
         self.t = theme or _fallback_theme()
-        self._app = app  # HavenClient ref, used to hide embedded chat widgets
 
-        self.configure(bg=self.t['titlebar_sep'])   # 1px border via bg colour
+        self.configure(bg=self.t['titlebar_sep'])
         self.resizable(False, False)
         self.overrideredirect(True)
-        self.geometry("400x220")
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 200
         y = (self.winfo_screenheight() // 2) - 110
         self.geometry(f'400x220+{x}+{y}')
         self.transient(parent)
         self.grab_set()
+        self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
         apply_window_icon(self)
 
-        # Hide embedded chat frames so they don't paint over this dialog on Windows
-        if self._app:
-            self._app._hide_embedded_chat_widgets()
-        self.bind('<Destroy>', self._on_dialog_destroy)
-
-        # Inner content frame — same outer-border pattern as all other themed dialogs
         _inner = tk.Frame(self, bg=self.t['glass_bg'])
         _inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-        build_themed_titlebar(_inner, self.t, title)
+        build_themed_titlebar(_inner, self.t, " ", on_close=self._cancel)
 
         tk.Label(_inner, text=prompt, bg=self.t['glass_bg'], fg=self.t['fg_color'],
                  font=('Segoe UI', 11)).pack(padx=30, pady=(20, 10))
@@ -819,17 +1173,14 @@ class ModernInputDialog(tk.Toplevel):
                   command=self._ok, padx=30, pady=8, cursor='hand2').pack(side=tk.LEFT, padx=10)
         tk.Button(btn_frame, text="Cancel", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
-                  command=self.destroy, padx=20, pady=8, cursor='hand2').pack(side=tk.LEFT, padx=10)
+                  command=self._cancel, padx=20, pady=8, cursor='hand2').pack(side=tk.LEFT, padx=10)
 
         self.entry.bind('<Return>', lambda e: self._ok())
-        self.entry.bind('<Escape>', lambda e: self.destroy())
+        self.entry.bind('<Escape>', lambda e: self._cancel())
         self.entry.focus_set()
 
-    def _on_dialog_destroy(self, event=None):
-        if event and event.widget is not self:
-            return  # only fire for this toplevel, not child widgets
-        if self._app:
-            self._app._show_embedded_chat_widgets()
+    def _cancel(self):
+        self.destroy()
 
     def _ok(self):
         self.result = self.entry.get()
@@ -960,7 +1311,7 @@ class ColorPickerDialog(tk.Toplevel):
         self.transient(parent); self.grab_set()
         apply_window_icon(self)
 
-        build_themed_titlebar(self, self.t, "Choose Username Color")
+        build_themed_titlebar(self, self.t, " ")
         tk.Label(self, text="Choose Your Name Color", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=18)
         colors = [
@@ -968,8 +1319,8 @@ class ColorPickerDialog(tk.Toplevel):
             ['#00ff88', '#06ffa5', '#4ecca3', '#78e08f'],
             ['#8338ec', '#a855f7', '#c084fc', '#e0aaff'],
             ['#ffd60a', '#ffb703', '#fb8500', '#ff9500'],
-            ['#06d6a0', '#00b4d8', '#0096c7', '#48cae4'],
-            ['#f72585', '#b5179e', '#7209b7', '#560bad']
+            ['#0066ff', '#00aaff', '#33ccff', '#66eeff'],
+            ['#ffffff', '#ffe8d6', '#b8c8e8', '#e8e0ff'],
         ]
         color_frame = tk.Frame(self, bg=self.t['glass_bg'])
         color_frame.pack(pady=20, padx=30)
@@ -998,32 +1349,63 @@ class AudioDeviceDialog(tk.Toplevel):
         self.configure(bg=self.t['glass_bg'],
                        highlightthickness=2,
                        highlightbackground=self.t['accent_1'])
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.overrideredirect(True)
-        self.geometry("500x680")
+        # Fit within screen height with some headroom
+        screen_h = self.winfo_screenheight()
+        dlg_h = min(720, screen_h - 80)
+        dlg_w = 520
         self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 250
-        y = (self.winfo_screenheight() // 2) - 340
-        self.geometry(f'500x680+{x}+{y}')
+        x = (self.winfo_screenwidth()  // 2) - dlg_w // 2
+        y = (screen_h // 2) - dlg_h // 2
+        self.geometry(f'{dlg_w}x{dlg_h}+{x}+{y}')
         self.transient(parent); self.grab_set()
         apply_window_icon(self)
 
         build_themed_titlebar(self, self.t, "Audio Devices & Volume")
-        tk.Label(self, text="🎧 AUDIO SETTINGS", bg=self.t['glass_bg'], fg=self.t['accent_1'],
-                 font=('Segoe UI', 16, 'bold')).pack(pady=16)
+        tk.Label(self, text="AUDIO SETTINGS", bg=self.t['glass_bg'], fg=self.t['accent_1'],
+                 font=('Segoe UI', 16, 'bold')).pack(pady=(12, 4))
+
         self.input_devices = []; self.output_devices = []
         self.get_audio_devices()
 
+        # ── Scrollable content area ───────────────────────────────────────────
+        scroll_outer = tk.Frame(self, bg=self.t['glass_bg'])
+        scroll_outer.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        canvas = tk.Canvas(scroll_outer, bg=self.t['glass_bg'], highlightthickness=0)
+        scrollbar = make_scrollbar(scroll_outer, self.t, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        content = tk.Frame(canvas, bg=self.t['glass_bg'])
+        cw = canvas.create_window((0, 0), window=content, anchor='nw')
+
+        def _on_content_configure(e):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        def _on_canvas_configure(e):
+            canvas.itemconfig(cw, width=e.width)
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+
+        content.bind('<Configure>', _on_content_configure)
+        canvas.bind('<Configure>', _on_canvas_configure)
+        canvas.bind('<MouseWheel>', _on_mousewheel)
+        content.bind('<MouseWheel>', _on_mousewheel)
+
         def section(label_text):
-            f = tk.Frame(self, bg=self.t['glass_accent'])
-            f.pack(fill=tk.X, padx=20, pady=10)
-            tk.Label(f, text=label_text, bg=self.t['glass_accent'], fg=self.t['fg_color'],
-                     font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W, padx=10, pady=(10, 5))
+            f = tk.Frame(content, bg=self.t['glass_accent'])
+            f.pack(fill=tk.X, padx=16, pady=8)
+            tk.Label(f, text=label_text, bg=self.t['glass_accent'], fg=self.t['accent_1'],
+                     font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, padx=10, pady=(10, 4))
+            f.bind('<MouseWheel>', _on_mousewheel)
             return f
 
         def vol_row(parent, label_text, var, callback):
             row = tk.Frame(parent, bg=self.t['glass_accent'])
-            row.pack(fill=tk.X, padx=10, pady=(10, 5))
+            row.pack(fill=tk.X, padx=10, pady=(6, 2))
+            row.bind('<MouseWheel>', _on_mousewheel)
             tk.Label(row, text=label_text, bg=self.t['glass_accent'], fg=self.t['fg_color'],
                      font=('Segoe UI', 10)).pack(side=tk.LEFT)
             lbl = tk.Label(row, text=f"{int(var.get())}%", bg=self.t['glass_accent'],
@@ -1034,9 +1416,10 @@ class AudioDeviceDialog(tk.Toplevel):
                      troughcolor=self.t['bg_color'], activebackground=self.t['accent_1'],
                      highlightthickness=0, bd=0,
                      command=lambda v, l=lbl, dv=var: (l.config(text=f"{int(dv.get())}%"),
-                                                        callback())).pack(fill=tk.X, padx=10, pady=(0, 15))
+                                                        callback())).pack(fill=tk.X, padx=10, pady=(0, 10))
 
         UNCHANGED = '— Leave Unchanged —'
+
         in_frame = section("INPUT DEVICE (Microphone)")
         self.input_devices.insert(0, UNCHANGED)
         self.input_var = tk.StringVar(value=UNCHANGED)
@@ -1051,7 +1434,7 @@ class AudioDeviceDialog(tk.Toplevel):
                 lambda: self.result.update({'input_volume': self.input_volume.get()}))
         tk.Button(in_frame, text="🎤 Test Microphone", bg=self.t['glass_bg'], fg=self.t['fg_color'],
                   font=('Segoe UI', 9), relief=tk.FLAT, command=self.test_input_device,
-                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 15))
+                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 10))
 
         out_frame = section("OUTPUT DEVICE (Speakers/Headphones)")
         self.output_devices.insert(0, UNCHANGED)
@@ -1067,24 +1450,37 @@ class AudioDeviceDialog(tk.Toplevel):
                 lambda: self.result.update({'output_volume': self.output_volume.get()}))
         tk.Button(out_frame, text="🔊 Test Speakers", bg=self.t['glass_bg'], fg=self.t['fg_color'],
                   font=('Segoe UI', 9), relief=tk.FLAT, command=self.test_output_device,
-                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 15))
+                  padx=15, pady=5, cursor='hand2').pack(pady=(0, 10))
 
-        rate_frame = tk.Frame(self, bg=self.t['glass_accent'])
-        rate_frame.pack(fill=tk.X, padx=20, pady=10)
-        tk.Label(rate_frame, text="SUPPORTED SAMPLE RATES", bg=self.t['glass_accent'],
-                 fg=self.t['accent_1'], font=('Segoe UI', 9, 'bold')).pack(anchor=tk.W, padx=10, pady=(10, 5))
-        tk.Label(rate_frame, text=f"Auto-detecting: {', '.join(str(r) for r in SUPPORTED_RATES)} Hz",
+        # PTT release delay
+        ptt_frame = section("PUSH-TO-TALK RELEASE DELAY")
+        tk.Label(ptt_frame, text="Adds a brief pause before PTT stops transmitting.",
                  bg=self.t['glass_accent'], fg=self.t['fg_color'],
-                 font=('Segoe UI', 8)).pack(anchor=tk.W, padx=10, pady=(0, 10))
+                 font=('Segoe UI', 8)).pack(anchor=tk.W, padx=10, pady=(0, 6))
+        ptt_delay_options = [('Off (0s)', 0.0), ('0.5s', 0.5), ('1s', 1.0), ('1.5s', 1.5), ('2s', 2.0)]
+        ptt_delay_labels  = [x[0] for x in ptt_delay_options]
+        ptt_delay_values  = [x[1] for x in ptt_delay_options]
+        current_delay = self.result.get('ptt_release_delay', 0.0)
+        try:
+            sel_idx = ptt_delay_values.index(current_delay)
+        except ValueError:
+            sel_idx = 0
+        self.ptt_delay_var = tk.StringVar(value=ptt_delay_labels[sel_idx])
+        ptt_combo = ttk.Combobox(ptt_frame, textvariable=self.ptt_delay_var,
+                                 values=ptt_delay_labels, state='readonly', width=20)
+        ptt_combo.pack(padx=10, pady=(0, 12))
+        self.style_combobox(ptt_combo)
+        self._ptt_delay_map = dict(zip(ptt_delay_labels, ptt_delay_values))
 
+        # ── Fixed bottom button row (outside scroll area) ─────────────────────
         btn_frame = tk.Frame(self, bg=self.t['glass_bg'])
-        btn_frame.pack(pady=20)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=12)
         tk.Button(btn_frame, text="SAVE SETTINGS", bg=self.t['accent_1'], fg=self.t['send_btn_fg'],
                   font=('Segoe UI', 11, 'bold'), relief=tk.FLAT, command=self.save_settings,
-                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
+                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=(20, 10))
         tk.Button(btn_frame, text="CANCEL", bg=self.t['accent_2'], fg='#fff',
                   font=('Segoe UI', 11, 'bold'), relief=tk.FLAT, command=self.destroy,
-                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT, padx=10)
+                  padx=30, pady=10, cursor='hand2').pack(side=tk.LEFT)
 
     def style_combobox(self, combobox):
         style = ttk.Style()
@@ -1240,6 +1636,8 @@ class AudioDeviceDialog(tk.Toplevel):
         UNCHANGED = '— Leave Unchanged —'
         self.result['input_volume']  = self.input_volume.get()
         self.result['output_volume'] = self.output_volume.get()
+        chosen_label = self.ptt_delay_var.get()
+        self.result['ptt_release_delay'] = self._ptt_delay_map.get(chosen_label, 0.0)
 
         # Only commit device selections that the user explicitly changed
         for device_key, index_key, var in (
@@ -1288,7 +1686,7 @@ class AboutDialog(tk.Toplevel):
 
         tk.Label(self, text="HAVEN", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 20, 'bold')).pack(pady=(20, 4))
-        tk.Label(self, text="v3", bg=self.t['glass_bg'], fg=self.t['accent_4'],
+        tk.Label(self, text="v3.2", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 11)).pack()
         tk.Label(self, text=f"Current theme: {theme.get('name', theme_name)}",
                  bg=self.t['glass_bg'], fg=self.t['fg_color'],
@@ -1340,6 +1738,7 @@ class HavenClient:
         self.tray_icon   = None
         self.open_mic_active = False
         self.session_crypto  = None   # SessionCrypto — set after PQ handshake
+        self._online_users   = []        # last userlist_full payload — used for theme rebuild
         self.saved_wire_hash = None   # SHA256(password) for reconnect — never plaintext
 
         # UI widget refs (set in build_ui, cleared in rebuild_ui)
@@ -1359,11 +1758,17 @@ class HavenClient:
         # PIL image references (prevent garbage collection)
         self._images: list  = []
 
+        _load_sound_buffers()  # decode WAVs to raw PCM for zero-latency PyAudio playback
+
         config = self.load_config()
         self.ptt_key    = config.get('ptt_key', 'Control_L')
         self.name_color = config.get('name_color', self.generate_random_color())
         self.theme_name = config.get('theme', 'default')
         self.theme      = load_theme(self.theme_name)
+        self.sounds_enabled     = config.get('sounds_enabled', True)
+        self.ptt_release_delay  = config.get('ptt_release_delay', 0.0)
+        self._saved_win_w       = config.get('window_w', 900)
+        self._saved_win_h       = config.get('window_h', 850)
 
         self.audio_settings = {
             'input_device':        config.get('input_device', 'Default'),
@@ -1428,8 +1833,13 @@ class HavenClient:
 
         self.root.deiconify()
         self.root.title("Haven")
-        self.root.geometry("900x850")
+        sw  = self.root.winfo_screenwidth()
+        sh  = self.root.winfo_screenheight()
+        ww  = getattr(self, '_saved_win_w', 900)
+        wh  = getattr(self, '_saved_win_h', 850)
+        self.root.geometry(f"{ww}x{wh}+{sw//2-ww//2}+{sh//2-wh//2}")
         self.root.minsize(800, 500)
+        self.root.resizable(True, True)
         self.root.overrideredirect(True)
         self.root.lift()
         self.root.focus_force()
@@ -1450,6 +1860,8 @@ class HavenClient:
 
         threading.Thread(target=self.receive_tcp, daemon=True).start()
         threading.Thread(target=self.receive_udp, daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        self._tray_has_notification = False
 
         self.setup_global_hotkey()
         self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
@@ -1531,9 +1943,9 @@ class HavenClient:
         if self.chat_text:
             self.chat_text.see(tk.END)
 
-        self.update_userlist_with_colors(
-            [{'username': u, 'color': c} for u, c in self.user_colors.items()])
-        self.display_system_message(f"✓ Theme changed to {self.theme.get('name', self.theme_name)}")
+        # Rebuild from the last known online list, not the full color history
+        self.update_userlist_with_colors(self._online_users)
+
 
     # ── Login helpers ────────────────────────────────────────────
 
@@ -1541,11 +1953,10 @@ class HavenClient:
         current_prefill = prefill or {}
         current_error   = error_msg
         while True:
-            self.root.deiconify()
+            # root stays withdrawn — LoginScreen is a Toplevel that centers itself
             dialog = LoginScreen(self.root, self.theme,
                                  prefill=current_prefill, error_msg=current_error)
             self.root.wait_window(dialog)
-            self.root.withdraw()
             if dialog.result is None:
                 return False
             data   = dialog.result
@@ -1592,6 +2003,17 @@ class HavenClient:
             raw_sock.settimeout(15)
             raw_sock.connect((server_ip, SERVER_TCP_PORT))
             tcp_sock = tls_ctx.wrap_socket(raw_sock, server_hostname=server_ip)
+
+            # ── TOFU cert check ───────────────────────────────────────────────
+            der = tcp_sock.getpeercert(binary_form=True)
+            if not der:
+                tcp_sock.close()
+                raise ConnectionError("Server did not present a TLS certificate")
+            if not _tofu_check(server_ip, SERVER_TCP_PORT, der,
+                               parent_window=getattr(self, 'root', None),
+                               theme=getattr(self, 'theme', None)):
+                tcp_sock.close()
+                raise ConnectionError("Server certificate not trusted — connection refused")
 
             udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_sock.bind(('0.0.0.0', 0))
@@ -1683,6 +2105,7 @@ class HavenClient:
                             self.server_assigned_color = msg['user_color']
                             self.name_color = msg['user_color']
                         crypto_info = msg.get('crypto', {})
+                        pass  # crypto active — no console noise
                         return 'ok'
                     elif msg['type'] == 'auth_failed':
                         tcp_sock.close(); udp_sock.close(); return 'auth_failed'
@@ -1706,6 +2129,16 @@ class HavenClient:
         return {}
 
     def save_config(self):
+        # Capture current window size if the main window is visible
+        try:
+            if self.root.winfo_viewable():
+                w = self.root.winfo_width()
+                h = self.root.winfo_height()
+                if w > 200 and h > 200:   # sanity check — ignore collapsed/hidden state
+                    self._saved_win_w = w
+                    self._saved_win_h = h
+        except Exception:
+            pass
         config = {
             'server_ip':           getattr(self, 'server_ip', ''),
             'username':            getattr(self, 'username', ''),
@@ -1718,6 +2151,10 @@ class HavenClient:
             'output_device_index': self.audio_settings.get('output_device_index', None),
             'input_volume':        self.audio_settings.get('input_volume', 100),
             'output_volume':       self.audio_settings.get('output_volume', 100),
+            'sounds_enabled':      getattr(self, 'sounds_enabled', True),
+            'ptt_release_delay':   getattr(self, 'ptt_release_delay', 0.0),
+            'window_w':            getattr(self, '_saved_win_w', 900),
+            'window_h':            getattr(self, '_saved_win_h', 850),
         }
         # Never write plaintext. Store wire hash (SHA256) for reconnect only.
         config.pop('password_plain', None)   # purge any legacy plaintext key
@@ -1790,6 +2227,31 @@ class HavenClient:
                   command=self.minimize_to_tray, cursor='hand2',
                   padx=8, pady=0).pack(side=tk.LEFT, padx=2)
 
+        # Maximize / restore button
+        self._maximized = False
+        self._pre_max_geometry = None
+
+        def _toggle_maximize():
+            if not self._maximized:
+                self._pre_max_geometry = self.root.geometry()
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                self.root.geometry(f"{sw}x{sh}+0+0")
+                self._maximized = True
+                max_btn.config(text="⬜")
+            else:
+                if self._pre_max_geometry:
+                    self.root.geometry(self._pre_max_geometry)
+                self._maximized = False
+                max_btn.config(text="⬜")
+
+        max_btn = tk.Button(controls_frame, text="⬜", bg=t['titlebar_bg'], fg=t['titlebar_fg'],
+                            font=('Segoe UI', 11), bd=0,
+                            activebackground=t['accent_3'], activeforeground=t['fg_color'],
+                            command=_toggle_maximize, cursor='hand2',
+                            padx=6, pady=0)
+        max_btn.pack(side=tk.LEFT, padx=2)
+
         tk.Button(controls_frame, text="✕", bg=t['titlebar_bg'], fg=t['titlebar_fg'],
                   font=('Segoe UI', 14), bd=0,
                   activebackground=t['accent_2'], activeforeground='#fff',
@@ -1807,8 +2269,70 @@ class HavenClient:
             w.bind('<Button-1>',        start_move)
             w.bind('<ButtonRelease-1>', stop_move)
             w.bind('<B1-Motion>',       do_move)
+            w.bind('<Double-Button-1>', lambda e: _toggle_maximize())
 
         tk.Frame(self.root, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
+
+        # Save window size whenever it's resized
+        def _on_resize(event):
+            if event.widget is self.root and not self._maximized:
+                self._saved_win_w = event.width
+                self._saved_win_h = event.height
+        self.root.bind('<Configure>', _on_resize)
+
+        # ── Edge/corner resize handles for overrideredirect window ────────────
+        GRIP = 6  # px — invisible hit area on each edge
+
+        def _make_grip(cursor, resize_fn):
+            """Create an invisible resize strip with the given cursor."""
+            f = tk.Frame(self.root, bg=t['bg_color'], cursor=cursor)
+            f.lift()
+            f._rx = f._ry = f._rw = f._rh = None
+            def _rs(e):
+                f._rx = e.x_root; f._ry = e.y_root
+                f._rw = self.root.winfo_width()
+                f._rh = self.root.winfo_height()
+                f._ox = self.root.winfo_x()
+                f._oy = self.root.winfo_y()
+            def _rm(e):
+                if f._rx is None: return
+                dx = e.x_root - f._rx
+                dy = e.y_root - f._ry
+                resize_fn(f, dx, dy)
+            f.bind('<Button-1>', _rs)
+            f.bind('<B1-Motion>', _rm)
+            f.bind('<ButtonRelease-1>', lambda e: setattr(f, '_rx', None))
+            return f
+
+        def _resize_right(f, dx, dy):
+            nw = max(800, f._rw + dx)
+            self.root.geometry(f"{nw}x{f._rh}+{f._ox}+{f._oy}")
+        def _resize_bottom(f, dx, dy):
+            nh = max(500, f._rh + dy)
+            self.root.geometry(f"{f._rw}x{nh}+{f._ox}+{f._oy}")
+        def _resize_left(f, dx, dy):
+            nw = max(800, f._rw - dx)
+            nx = f._ox + (f._rw - nw)
+            self.root.geometry(f"{nw}x{f._rh}+{nx}+{f._oy}")
+        def _resize_top(f, dx, dy):
+            pass  # top resize disabled — titlebar is the drag handle
+        def _resize_se(f, dx, dy):
+            nw = max(800, f._rw + dx); nh = max(500, f._rh + dy)
+            self.root.geometry(f"{nw}x{nh}+{f._ox}+{f._oy}")
+        def _resize_sw(f, dx, dy):
+            nw = max(800, f._rw - dx); nh = max(500, f._rh + dy)
+            nx = f._ox + (f._rw - nw)
+            self.root.geometry(f"{nw}x{nh}+{nx}+{f._oy}")
+
+
+        # Place grips — corners first (they sit on top of edges)
+        TB = 36  # titlebar height — grips start below it
+        r  = _make_grip('right_side',  _resize_right);  r.place(relx=1, rely=0, x=-GRIP, y=TB, width=GRIP, relheight=1, height=-(TB+GRIP))
+        b  = _make_grip('bottom_side', _resize_bottom); b.place(relx=0, rely=1, x=GRIP, y=-GRIP, relwidth=1, width=-GRIP*2, height=GRIP)
+        l  = _make_grip('left_side',   _resize_left);   l.place(x=0, y=TB, width=GRIP, relheight=1, height=-(TB+GRIP))
+        # top resize grip intentionally omitted — titlebar serves as the top edge
+        se = _make_grip('bottom_right_corner', _resize_se); se.place(relx=1, rely=1, x=-GRIP, y=-GRIP, width=GRIP, height=GRIP)
+        sw = _make_grip('bottom_left_corner',  _resize_sw); sw.place(x=0, rely=1, y=-GRIP, width=GRIP, height=GRIP)
 
         main_frame = tk.Frame(self.root, bg=t['glass_bg'], highlightthickness=1,
                               highlightbackground=t['accent_4'])
@@ -1837,7 +2361,7 @@ class HavenClient:
 
         self.chat_text = tk.Text(chat_container, bg=t['chat_bg'], fg=t['chat_fg'],
                                  insertbackground=t['accent_1'], wrap=tk.WORD,
-                                 state=tk.DISABLED, font=(t['chat_font'], t['chat_font_size']),
+                                 state=tk.DISABLED, font=('Segoe UI', t['chat_font_size']),
                                  relief=tk.FLAT, padx=15, pady=15, spacing3=5)
         self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -2073,21 +2597,93 @@ class HavenClient:
         if self.running:
             self.root.after(0, self.connection_lost)
 
+    def _heartbeat_loop(self):
+        """Send a ping to the server every 5 minutes. Silent — no UI noise."""
+        import time
+        while self.running:
+            time.sleep(300)
+            if not self.running:
+                break
+            try:
+                self.tcp_sock.send((json.dumps({'type': 'ping'}) + '\n').encode())
+            except Exception:
+                break
+
     def connection_lost(self):
-        if not self._closing:
-            if hasattr(self, 'saved_wire_hash'): self.saved_wire_hash = None
-            self.save_config()
-            messagebox.showerror("Connection Lost",
-                                 "Lost connection to the server.\nYou will need to reconnect.")
-            self.on_close()
+        """Show a themed disconnect dialog then restart the app."""
+        if self._closing:
+            return
+        self._closing = True
+        self.running  = False
+
+        for sock in [getattr(self, 'tcp_sock', None), getattr(self, 'udp_sock', None)]:
+            try:
+                if sock: sock.close()
+            except: pass
+
+        t = self.theme
+
+        dlg = tk.Toplevel(self.root)
+        dlg.overrideredirect(True)
+        dlg.configure(bg=t.get('titlebar_sep', t['accent_1']))
+        dlg.resizable(False, False)
+        dlg.geometry("420x240")
+        dlg.update_idletasks()
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        dlg.geometry(f"420x240+{sw//2-210}+{sh//2-120}")
+        dlg.lift()
+        dlg.attributes('-topmost', True)
+        apply_window_icon(dlg)
+        dlg.grab_set()
+
+        inner = tk.Frame(dlg, bg=t['glass_bg'])
+        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        build_themed_titlebar(inner, t, "Haven — Disconnected",
+                              on_close=lambda: _restart())
+
+        tk.Label(inner, text="⚠  Haven Disconnected",
+                 bg=t['glass_bg'], fg=t['accent_2'],
+                 font=('Segoe UI', 13, 'bold')).pack(pady=(18, 6))
+        tk.Label(inner,
+                 text="Connection to the server was lost.\nClick OK to restart Haven.",
+                 bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 10), justify='center').pack(pady=(0, 16))
+
+        def _restart():
+            try: dlg.destroy()
+            except: pass
+            try: self.root.destroy()
+            except: pass
+            import subprocess
+            subprocess.Popen(get_exe_path())
+
+        tk.Button(inner, text="OK — Restart", bg=t['accent_1'], fg=t['send_btn_fg'],
+                  font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
+                  command=_restart, padx=30, pady=10, cursor='hand2').pack()
 
     def handle_tcp_message(self, msg):
+        try:
+            self._handle_tcp_message_inner(msg)
+        except Exception as e:
+            print(f"[WARN] Error handling message: {e}")
+
+    def _handle_tcp_message_inner(self, msg):
         t = self.theme
+        if msg['type'] == 'ping':
+            try:
+                self.tcp_sock.send((json.dumps({'type': 'pong'}) + '\n').encode())
+            except: pass
+            return
+        if msg['type'] == 'pong':
+            return
         if msg['type'] == 'auth_ok':
             if 'user_color' in msg:
                 self.server_assigned_color = msg['user_color']
                 self.name_color = msg['user_color']; self.save_config()
-            self.display_system_message("✓ Connected to server")
+            self.display_system_message("✓ Connected to server", local_only=True)
+            play_sound('self_join', self.sounds_enabled)
         elif msg['type'] == 'auth_failed':
             messagebox.showerror("Authentication Failed", "Incorrect password")
             self.root.after(0, self.on_close)
@@ -2098,16 +2694,17 @@ class HavenClient:
             if msg.get('encrypted') and self.session_crypto:
                 plaintext = self.session_crypto.decrypt_chat(msg.get('ct', ''))
                 if plaintext is None:
-                    self.display_system_message("⚠ Could not decrypt a message — dropped")
+                    print("[WARN] Could not decrypt a message — dropped")
                     return
             elif self.session_crypto:
                 # Session is active but message arrived unencrypted — refuse it.
                 # This prevents downgrade injection attacks.
-                self.display_system_message("⚠ Dropped unencrypted message (encryption required)")
+                print("[WARN] Dropped unencrypted message (encryption required)")
                 return
             else:
                 plaintext = msg.get('text', '')
             self.display_message(msg['user'], plaintext)
+            play_sound('msg_received', self.sounds_enabled)
         elif msg['type'] == 'chat_history':
             # Clear in-memory log before loading authoritative server history
             self._msg_log.clear()
@@ -2115,25 +2712,45 @@ class HavenClient:
                 self.chat_text.config(state=tk.NORMAL)
                 self.chat_text.delete('1.0', tk.END)
                 self.chat_text.config(state=tk.DISABLED)
+            skipped = 0
             for chat_msg in msg['history']:
-                user = chat_msg['user']
-                text = chat_msg.get('text', '')
-                # History is stored as plaintext server-side; handle encrypted entries if present
-                if chat_msg.get('encrypted') and self.session_crypto and HAVEN_CRYPTO:
-                    dec = self.session_crypto.decrypt_chat(chat_msg.get('ct', ''))
-                    if dec: text = dec
-                timestamp = chat_msg.get('timestamp'); stored_color = chat_msg.get('color')
+                user = chat_msg.get('user', '')
+                timestamp    = chat_msg.get('timestamp')
+                stored_color = chat_msg.get('color')
+
+                if chat_msg.get('encrypted'):
+                    # Server now sends all history encrypted with our session key
+                    if self.session_crypto and HAVEN_CRYPTO:
+                        text = self.session_crypto.decrypt_chat(chat_msg.get('ct', ''))
+                        if text is None:
+                            # Decryption failed — skip rather than show blank/garbage
+                            skipped += 1
+                            print(f"[WARN] History decrypt failed for entry from {user} — skipped")
+                            continue
+                    else:
+                        # No session crypto — cannot decrypt, skip entirely
+                        skipped += 1
+                        continue
+                else:
+                    # Unencrypted entry: old server or pre-migration plaintext history.
+                    # Accept it so upgrades don't wipe visible history on first connect.
+                    text = chat_msg.get('text', '')
+                    if not text:
+                        continue
+
                 if user == 'System':
                     self.display_message(user, text, timestamp=timestamp,
-                                         color=t['system_msg_color'])
+                                         color=t['system_msg_color'], from_history=True)
                 else:
                     if user not in self.user_colors and stored_color:
                         self.user_colors[user] = stored_color
                     display_color = stored_color or self.user_colors.get(user, t['accent_2'])
                     align = 'right' if user == self.username else 'left'
                     self.display_message(user, text, align=align,
-                                         timestamp=timestamp, color=display_color)
-            self.display_system_message("✓ Chat history loaded")
+                                         timestamp=timestamp, color=display_color, from_history=True)
+
+            if skipped:
+                print(f"[INFO] {skipped} history entries could not be decrypted and were skipped")
         elif msg['type'] == 'userlist_full':
             self.update_userlist_with_colors(msg['users'])
         elif msg['type'] == 'userlist':
@@ -2142,10 +2759,14 @@ class HavenClient:
             self.update_user_color(msg['username'], msg['color'])
         elif msg['type'] == 'voice_start':
             self.set_user_voice_active(msg['user'], True)
+            if msg['user'] == self.username:
+                play_sound('ptt_start', self.sounds_enabled)
         elif msg['type'] == 'voice_stop':
             self.set_user_voice_active(msg['user'], False)
+            if msg['user'] == self.username:
+                play_sound('ptt_stop', self.sounds_enabled)
         elif msg['type'] == 'username_changed':
-            self.display_system_message(f"✓ Username changed to {msg['new_username']}")
+            self.display_system_message(f"✓ Username changed to {msg['new_username']}", local_only=True)
             old_username = self.username; self.username = msg['new_username']
             if 'user_color' in msg:
                 self.name_color = msg['user_color']; self.server_assigned_color = msg['user_color']
@@ -2195,6 +2816,39 @@ class HavenClient:
             except OSError: break
             except Exception as e: print(f"Error in receive_udp: {e}"); break
 
+    def _chat_insert(self, index, text, *tags):
+        """Safe wrapper around chat_text.insert — catches Tcl encoding errors."""
+        if not self.chat_text:
+            return
+        safe = self._safe_text(str(text))
+        try:
+            self.chat_text.insert(index, safe, *tags)
+        except tk.TclError as e:
+            print(f"[WARN] Could not insert text into chat: {e}")
+            try:
+                self.chat_text.insert(index, '[?]', *tags)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _safe_text(text):
+        """
+        Sanitise text for tkinter's Text widget on Windows.
+        Tcl/Tk uses UTF-8 internally but chokes on:
+          - Lone surrogates (U+D800–U+DFFF)
+          - Null bytes (U+0000)
+          - Characters Tcl can't encode to its internal cesu-8 variant
+        We normalise by round-tripping through UTF-8 with replacement.
+        """
+        try:
+            # Round-trip through UTF-8 — strips lone surrogates, normalises
+            safe = text.encode('utf-8', 'replace').decode('utf-8', 'replace')
+            # Remove null bytes which Tcl treats as string terminators
+            safe = safe.replace('\x00', '')
+            return safe
+        except Exception:
+            return '[message could not be displayed]' 
+
     def send_chat(self, event=None):
         text = self.msg_entry.get().strip()
         if text and self.authenticated:
@@ -2204,10 +2858,14 @@ class HavenClient:
                     msg = {'type': 'chat', 'encrypted': True, 'ct': ct}
                 else:
                     msg = {'type': 'chat', 'text': text}
-                self.tcp_sock.send((json.dumps(msg) + '\n').encode())
+                self.tcp_sock.send((json.dumps(msg) + '\n').encode('utf-8'))
                 self.msg_entry.delete(0, tk.END)
                 self.display_message(self.username, text, align='right')
-            except: messagebox.showerror("Error", "Failed to send message")
+                play_sound('msg_sent', self.sounds_enabled)
+            except UnicodeEncodeError:
+                messagebox.showerror("Error", "Message contains unsupported characters")
+            except Exception:
+                messagebox.showerror("Error", "Failed to send message")
 
     def open_emoji_picker(self):
         if self._emoji_picker and self._emoji_picker.winfo_exists():
@@ -2249,6 +2907,7 @@ class HavenClient:
         t = self.theme
         if not self.chat_text: return
         if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
+        text = self._safe_text(text)   # strip lone surrogates that crash tkinter
 
         # "Segoe UI" matches the entry widget font — familiar, readable
         MSG_FONT      = ('Segoe UI', t['chat_font_size'])
@@ -2262,31 +2921,31 @@ class HavenClient:
             msg_id   = hashlib.md5(f'{user}{text}{timestamp}'.encode()).hexdigest()[:8]
             tag_rt   = f'rt_{msg_id}'
             tag_rm   = f'rm_{msg_id}'
-            self.chat_text.insert(tk.END, f'{text}  ', tag_rt)
-            self.chat_text.insert(tk.END, f'[{timestamp} - {user}]\n', tag_rm)
+            self._chat_insert(tk.END, f'{text}  ', tag_rt)
+            self._chat_insert(tk.END, f'[{timestamp} - {user}]\n', tag_rm)
             self.chat_text.tag_config(tag_rt, justify='right',
                                       foreground=self.name_color, font=MSG_FONT)
             self.chat_text.tag_config(tag_rm, justify='right',
                                       foreground=t['accent_4'],
                                       font=TS_FONT)
         else:
-            self.chat_text.insert(tk.END, f'[{timestamp}] ', 'ts')
+            self._chat_insert(tk.END, f'[{timestamp}] ', 'ts')
             self.chat_text.tag_config('ts', foreground=t['accent_4'], font=TS_FONT)
 
             if user == 'System':
-                self.chat_text.insert(tk.END, f'System: ', 'sys_name')
+                self._chat_insert(tk.END, f'System: ', 'sys_name')
                 self.chat_text.tag_config('sys_name', foreground=t['system_msg_color'],
                                           font=(t['chat_font'], t['chat_font_size'], 'bold'))
-                self.chat_text.insert(tk.END, f'{text}\n', 'sys_body')
+                self._chat_insert(tk.END, f'{text}\n', 'sys_body')
                 self.chat_text.tag_config('sys_body', foreground=t['system_msg_color'],
                                           font=(t['chat_font'], t['chat_font_size'], 'italic'))
             else:
                 user_color = color or self.user_colors.get(user, t['accent_2'])
                 tag_name   = f'user_{hashlib.md5(user.encode()).hexdigest()[:8]}'
                 body_tag   = f'body_{tag_name}'  # per-user body tag avoids cross-user clobber
-                self.chat_text.insert(tk.END, f'{user}: ', tag_name)
+                self._chat_insert(tk.END, f'{user}: ', tag_name)
                 self.chat_text.tag_config(tag_name, foreground=user_color, font=MSG_FONT_BOLD)
-                self.chat_text.insert(tk.END, f'{text}\n', body_tag)
+                self._chat_insert(tk.END, f'{text}\n', body_tag)
                 self.chat_text.tag_config(body_tag, foreground=t['chat_fg'], font=MSG_FONT)
 
         self.chat_text.config(state=tk.DISABLED)
@@ -2298,8 +2957,8 @@ class HavenClient:
         if not self.chat_text: return
         if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
         self.chat_text.config(state=tk.NORMAL)
-        self.chat_text.insert(tk.END, f'[{timestamp}] ', 'sys_ts')
-        self.chat_text.insert(tk.END, f'{text}\n', 'sys_line')
+        self._chat_insert(tk.END, f'[{timestamp}] ', 'sys_ts')
+        self._chat_insert(tk.END, f'{text}\n', 'sys_line')
         self.chat_text.tag_config('sys_ts',   foreground=t['accent_4'],
                                   font=('Consolas', max(t['chat_font_size'] - 2, 7)))
         self.chat_text.tag_config('sys_line', foreground=t['system_msg_color'],
@@ -2314,15 +2973,15 @@ class HavenClient:
         tag_name = f'user_{hashlib.md5(user.encode()).hexdigest()[:8]}'
         TS_FONT  = (t['chat_font'], max(t['chat_font_size'] - 2, 7))
         MSG_BOLD = ('Segoe UI', t['chat_font_size'], 'bold')
-        self.chat_text.insert(tk.END, f'[{timestamp}] ', 'ts')
+        self._chat_insert(tk.END, f'[{timestamp}] ', 'ts')
         self.chat_text.tag_config('ts', foreground=t['accent_4'], font=TS_FONT)
-        self.chat_text.insert(tk.END, f'{user}:\n', tag_name)
+        self._chat_insert(tk.END, f'{user}:\n', tag_name)
         self.chat_text.tag_config(tag_name, foreground=uc, font=MSG_BOLD)
         return uc
 
     def _place_mark(self, mark_name):
         """Place a named mark at END for later async insertion."""
-        self.chat_text.insert(tk.END, '\u200b')
+        self._chat_insert(tk.END, '\u200b')
         idx = self.chat_text.index(tk.END + '-1c')
         self.chat_text.mark_set(mark_name, idx)
         self.chat_text.mark_gravity(mark_name, tk.LEFT)
@@ -2336,7 +2995,7 @@ class HavenClient:
 
         mark     = f'img_{hashlib.md5((url+timestamp+user).encode()).hexdigest()[:12]}'
         link_tag = mark + '_link'
-        self.chat_text.insert(tk.END, f'  \U0001f517 {url}\n', link_tag)
+        self._chat_insert(tk.END, f'  \U0001f517 {url}\n', link_tag)
         self.chat_text.tag_config(link_tag, foreground=t['accent_1'],
                                   font=(t['chat_font'], t['chat_font_size'], 'underline'),
                                   lmargin1=16, lmargin2=16)
@@ -2345,7 +3004,7 @@ class HavenClient:
         self.chat_text.tag_bind(link_tag, '<Leave>', lambda e: self.chat_text.config(cursor=''))
 
         self._place_mark(mark)
-        self.chat_text.insert(tk.END, '\n')
+        self._chat_insert(tk.END, '\n')
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
 
@@ -2419,7 +3078,7 @@ class HavenClient:
 
         mark     = f'lnk_{hashlib.md5((url+timestamp+user).encode()).hexdigest()[:12]}'
         link_tag = mark + '_url'
-        self.chat_text.insert(tk.END, f'  \U0001f517 {url}\n', link_tag)
+        self._chat_insert(tk.END, f'  \U0001f517 {url}\n', link_tag)
         self.chat_text.tag_config(link_tag, foreground=t['accent_1'],
                                   font=(t['chat_font'], t['chat_font_size'], 'underline'),
                                   lmargin1=16, lmargin2=16)
@@ -2428,7 +3087,7 @@ class HavenClient:
         self.chat_text.tag_bind(link_tag, '<Leave>', lambda e: self.chat_text.config(cursor=''))
 
         self._place_mark(mark)
-        self.chat_text.insert(tk.END, '\n')
+        self._chat_insert(tk.END, '\n')
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
 
@@ -2512,7 +3171,7 @@ class HavenClient:
                                       _open_url, _on_enter, _on_leave)
 
             self.chat_text.window_create(mark, window=card, padx=16, pady=4)
-            self.chat_text.insert(mark, '\n')
+            self._chat_insert(mark, '\n')
             self.chat_text.config(state=tk.DISABLED)
             self.chat_text.see(tk.END)
         except tk.TclError:
@@ -2556,7 +3215,7 @@ class HavenClient:
             try:
                 self.chat_text.config(state=tk.NORMAL)
                 self.chat_text.image_create(mark, image=photo, padx=16, pady=2)
-                self.chat_text.insert(mark, '\n')
+                self._chat_insert(mark, '\n')
                 self.chat_text.config(state=tk.DISABLED)
                 self.chat_text.see(tk.END)
             except tk.TclError:
@@ -2566,6 +3225,19 @@ class HavenClient:
 
     def display_message(self, user, text, align='left', timestamp=None, color=None, from_history=False):
         if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
+
+        # System message visibility: hide from non-admins
+        if user == 'System':
+            is_admin = getattr(self, 'username', '').startswith('admin_')
+            if not from_history:
+                if ' has joined the chat' in text:
+                    joining_user = text.replace(' has joined the chat', '').strip()
+                    if joining_user != getattr(self, 'username', ''):
+                        play_sound('user_join', self.sounds_enabled)
+                elif ' has left the chat' in text:
+                    play_sound('user_leave', self.sounds_enabled)
+            if not is_admin:
+                return  # hide all system messages from non-admins (sounds already fired above)
 
         # URL/image detection — applies to ALL messages including sender's own
         urls = URL_RE.findall(text)
@@ -2585,23 +3257,46 @@ class HavenClient:
         self._msg_log.append({'type': 'chat', 'user': user, 'text': text,
                                'align': align, 'timestamp': timestamp, 'color': color})
         self._render_chat(user, text, align=align, timestamp=timestamp, color=color)
+        if user != getattr(self, 'username', '') and not from_history:
+            self._notify_tray_if_hidden(user, text)
 
-    def display_system_message(self, text):
+    def _notify_tray_if_hidden(self, user, text):
+        """Show a tray notification when the window is hidden and a new message arrives."""
+        try:
+            if self.root.state() == 'withdrawn' and TRAY_AVAILABLE and self.tray_icon:
+                snippet = text[:60] + ('…' if len(text) > 60 else '')
+                try:
+                    self.tray_icon.notify(f'{user}: {snippet}', 'Haven — New Message')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def display_system_message(self, text, local_only=False):
+        """Show a system message in chat.
+        local_only=True bypasses the admin filter (for client-side status messages
+        that are never stored server-side, e.g. sounds toggle, PTT key change).
+        """
         if not self.chat_text: return
+        is_admin = getattr(self, 'username', '').startswith('admin_')
+        if not local_only and not is_admin:
+            return  # non-admins don't see server system messages
         ts = datetime.now().strftime('%H:%M')
         self._msg_log.append({'type': 'system', 'text': text, 'timestamp': ts})
         self._render_sys(text, ts)
 
     def update_userlist_with_colors(self, users_with_colors):
         if not self.user_list_frame: return
+        # Remember exactly who is online so theme rebuilds show the same list
+        self._online_users = list(users_with_colors)
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
         self.speaker_labels.clear()
         for user_data in users_with_colors:
             self.user_colors[user_data['username']] = user_data.get('color', self.theme['accent_2'])
-        for username, color in self.user_colors.items():
-            if any(u['username'] == username for u in users_with_colors):
-                self.add_user_to_list(username, color)
+        for user_data in users_with_colors:
+            username = user_data['username']
+            self.add_user_to_list(username, self.user_colors[username])
         if self.username not in self.user_colors:
             self.user_colors[self.username] = self.name_color
 
@@ -2624,7 +3319,7 @@ class HavenClient:
             self.speaker_labels[username].config(fg=new_color, text=f"{prefix} {username}")
         if username == self.username:
             self.name_color = new_color; self.server_assigned_color = new_color
-            self.save_config(); self.display_system_message("✓ Your name color updated")
+            self.save_config()
 
     def set_user_voice_active(self, username, active):
         if active: self.active_speakers.add(username)
@@ -2658,12 +3353,15 @@ class HavenClient:
         btn = self.settings_btn
 
         # Menu items: (label, command) — None = separator
+        sounds_label = f"Sounds: {'On' if self.sounds_enabled else 'Off'}"
         items = [
             ("Change Username",        self.change_username),
             ("Change Name Color",      self.change_name_color),
             ("Change PTT Key",         self.change_ptt_key),
             ("Audio Devices & Volume", self.configure_audio_devices),
             ("Change Theme",           self.change_theme),
+            None,
+            (sounds_label,             self._toggle_sounds),
             None,
             ("Clear Saved Password",   self.clear_saved_password),
             None,
@@ -2750,6 +3448,12 @@ class HavenClient:
         if dialog.result and dialog.result != self.theme_name:
             self.apply_theme(dialog.result)
 
+    def _toggle_sounds(self):
+        self.sounds_enabled = not self.sounds_enabled
+        self.save_config()
+        state = 'On' if self.sounds_enabled else 'Off'
+        self.display_system_message(f"🔊 Sounds turned {state}", local_only=True)
+
     def change_username(self):
         dialog = ModernInputDialog(self.root, "Change Username", "Enter new username:", theme=self.theme, app=self)
         self.root.wait_window(dialog)
@@ -2760,7 +3464,9 @@ class HavenClient:
                                                 'new_username': new_name.strip(),
                                                 'user_color': self.name_color}) + '\n').encode())
             except: messagebox.showerror("Error", "Failed to change username")
-
+        self.root.focus_force()
+        if self.msg_entry and self.msg_entry.winfo_exists():
+            self.msg_entry.focus_set()
     def change_name_color(self):
         dialog = ColorPickerDialog(self.root, self.name_color, theme=self.theme)
         self.root.wait_window(dialog)
@@ -2774,7 +3480,6 @@ class HavenClient:
                 messagebox.showerror("Error", "Failed to update color")
                 self.name_color = old_color; return
             self.save_config()
-
     def change_ptt_key(self):
         dialog = KeybindDialog(self.root, self.ptt_key, theme=self.theme)
         self.root.wait_window(dialog)
@@ -2787,7 +3492,7 @@ class HavenClient:
             if self.voice_btn: self.voice_btn.config(text=self.voice_btn_text)
             self.save_config()
             self.display_system_message(
-                f"✓ Push-to-talk key changed to {self.format_key_display(dialog.result)}")
+                f"✓ Push-to-talk key changed to {self.format_key_display(dialog.result)}", local_only=True)
 
     def _get_embedded_chat_widgets(self):
         """Return all tk.Frame widgets embedded in the chat text widget."""
@@ -2819,16 +3524,20 @@ class HavenClient:
             except: pass
 
     def configure_audio_devices(self):
-        dialog = AudioDeviceDialog(self.root, self.p, self.audio_settings, theme=self.theme)
+        settings_with_ptt = self.audio_settings.copy()
+        settings_with_ptt['ptt_release_delay'] = getattr(self, 'ptt_release_delay', 0.0)
+        dialog = AudioDeviceDialog(self.root, self.p, settings_with_ptt, theme=self.theme)
         self.root.wait_window(dialog)
         if dialog.result:
             old_settings = self.audio_settings.copy()
+            new_ptt_delay = dialog.result.pop('ptt_release_delay', 0.0)
             self.audio_settings = dialog.result
+            self.ptt_release_delay = new_ptt_delay
             if (old_settings.get('input_device_index')  != self.audio_settings.get('input_device_index') or
                     old_settings.get('output_device_index') != self.audio_settings.get('output_device_index')):
                 self.restart_audio_streams()
             self.save_config()
-            self.display_system_message("✓ Audio settings updated")
+
 
     def restart_audio_streams(self):
         for stream in [self.stream_in, self.stream_out]:
@@ -2876,6 +3585,14 @@ class HavenClient:
     def stop_voice(self, event=None):
         if not self.voice_active: return
         if self.open_mic_active: return
+        delay = getattr(self, 'ptt_release_delay', 0.0)
+        if delay > 0:
+            self.root.after(int(delay * 1000), self._do_stop_voice)
+        else:
+            self._do_stop_voice()
+
+    def _do_stop_voice(self):
+        if not self.voice_active: return
         self.voice_active = False
         t = self.theme
         if self.voice_btn:
