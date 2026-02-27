@@ -178,6 +178,85 @@ def print_sep(char='─', color=DIM_C):
     with _print_lock:
         print(f'{color}{char * term_width()}{RESET}')
 
+def draw_sigil_ascii(username, color_hex='#3ecfcf', width=21, height=11):
+    """Render a deterministic sigil as ASCII art — same algorithm as the desktop client."""
+    def _rgb(h):
+        h = h.lstrip('#')
+        r,g,b = int(h[:2],16), int(h[2:4],16), int(h[4:],16)
+        return f'\033[38;2;{r};{g};{b}m'
+    CLR = _rgb(color_hex)
+    grid = [[False]*width for _ in range(height)]
+    cx, cy = width/2.0, height/2.0
+    rx, ry = width*0.38, height*0.38
+
+    def _rng(seed):
+        h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
+        return random.Random(h)
+
+    r = _rng(f'sigil:{username}')
+    shape_type = r.choice(['polygon','star','orbital','rune'])
+
+    def pt(angle_deg, dx=1.0, dy=1.0):
+        a = math.radians(angle_deg - 90)
+        return (cx + rx*dx*math.cos(a), cy + ry*dy*math.sin(a))
+
+    def plot_line(x1,y1,x2,y2):
+        steps = max(abs(int(x2-x1)), abs(int(y2-y1)), 1)*3
+        for i in range(steps+1):
+            t = i/steps
+            ix,iy = int(round(x1+(x2-x1)*t)), int(round(y1+(y2-y1)*t))
+            if 0<=ix<width and 0<=iy<height: grid[iy][ix] = True
+
+    def plot_oval(ox,oy,orx,ory):
+        steps = max(int((orx+ory)*4),32)
+        for i in range(steps):
+            a = 2*math.pi*i/steps
+            ix,iy = int(round(ox+orx*math.cos(a))), int(round(oy+ory*math.sin(a)))
+            if 0<=ix<width and 0<=iy<height: grid[iy][ix] = True
+
+    def plot_poly(pts):
+        for i in range(len(pts)):
+            plot_line(*pts[i], *pts[(i+1)%len(pts)])
+
+    if shape_type == 'polygon':
+        sides = r.randint(3,7); rot = r.uniform(0,360/sides)
+        pts = [pt(rot+i*360/sides) for i in range(sides)]
+        plot_poly(pts)
+        if r.random()>0.4:
+            ir=r.uniform(0.35,0.6); is_=r.choice([sides,3,4]); ir2=r.uniform(0,360)
+            plot_poly([pt(ir2+i*360/is_,ir,ir) for i in range(is_)])
+        if r.random()>0.5:
+            ix,iy=int(round(cx)),int(round(cy))
+            if 0<=ix<width and 0<=iy<height: grid[iy][ix]=True
+    elif shape_type == 'star':
+        n=r.randint(4,7); outer=1.0; inner=r.uniform(0.35,0.55); rot=r.uniform(0,360/n)
+        spts=[pt(rot+i*180/n,outer if i%2==0 else inner,outer if i%2==0 else inner) for i in range(n*2)]
+        plot_poly(spts)
+        if r.random()>0.5:
+            ix,iy=int(round(cx)),int(round(cy))
+            if 0<=ix<width and 0<=iy<height: grid[iy][ix]=True
+    elif shape_type == 'orbital':
+        for i in range(r.randint(2,3)):
+            sc=(0.4+0.6*(i+1)/3)*0.85; plot_oval(cx,cy,rx*sc,ry*sc)
+        for _ in range(r.randint(2,4)):
+            a=r.uniform(0,math.pi)
+            plot_line(cx+rx*math.cos(a),cy+ry*math.sin(a),cx-rx*math.cos(a),cy-ry*math.sin(a))
+    elif shape_type == 'rune':
+        angs=sorted(r.uniform(0,360) for _ in range(r.randint(4,7)))
+        rpts=[pt(a,d,d) for a,d in zip(angs,[r.uniform(0.4,1.0) for _ in angs])]
+        for i in range(len(rpts)-1): plot_line(*rpts[i],*rpts[i+1])
+        if r.random()>0.4: plot_line(*rpts[-1],*rpts[0])
+        ix,iy=int(round(rpts[0][0])),int(round(rpts[0][1]))
+        if 0<=ix<width and 0<=iy<height: grid[iy][ix]=True
+
+    rows = [f'{CLR}╔{"═"*width}╗{RESET}']
+    for row in grid:
+        rows.append(f'{CLR}║{"".join("◆" if c else " " for c in row)}║{RESET}')
+    rows.append(f'{CLR}╚{"═"*width}╝{RESET}')
+    return rows
+
+
+
 def print_banner():
     print_sep('═')
     w = term_width()
@@ -192,7 +271,7 @@ def print_banner():
 def print_help():
     cmds = [
         ('/quit, /q',  'Disconnect and exit'),
-        ('/users',     'Show online users'),
+        ('/users [name]', 'List users or view profile + sigil'),
         ('/world',     'Show world lore'),
         ('/clear',     'Clear the screen'),
         ('/help',      'Show this help'),
@@ -438,13 +517,47 @@ class HavenSession:
         elif t in ('voice_start', 'voice_stop'):
             pass  # no voice in terminal client
 
-    def show_users(self):
-        if not self.users:
-            print_sys('No users online', DIM_C); return
-        print_sys(f'{len(self.users)} online:', ACCENT)
-        for name, clr in sorted(self.users.items()):
-            marker = '▶ ' if name == self.username else '  '
-            print(f'  {DIM_C}{marker}{RESET}{color_name(name, clr)}')
+    def show_users(self, target=None):
+        if target:
+            # Show sigil + identity for a specific user
+            if target not in self.users and target != self.username:
+                print_sys(f'Unknown user: {target}', WARN_C); return
+            clr = self.users.get(target) or self.color or '#3ecfcf'
+            print_sep('─')
+            # Sigil
+            sigil_lines = draw_sigil_ascii(target, clr)
+            for line in sigil_lines:
+                print('  ' + line)
+            print()
+            # Name + color
+            print(f'  {color_name(target, clr)}')
+            # World identity if we have it
+            ident = None
+            if self.world:
+                if target == self.username:
+                    ident = self.world.get('own_identity')
+                else:
+                    ident = self.world.get('identities', {}).get(target)
+            if ident:
+                soul = ident.get('soul_type','mortal')
+                icon = {'seraph':'✦','daemon':'⬡','mortal':'·'}.get(soul,'·')
+                print(f'  {ACCENT}{icon} {ident.get("title","")}{RESET}')
+                if ident.get('origin'):   print(f'  {DIM_C}{ident["origin"]}{RESET}')
+                if ident.get('faction'):  print(f'  {DIM_C}{ident["faction"]}{RESET}')
+                if ident.get('trait'):    print(f'  {LORE_C}{ITALIC}"{ident["trait"]}"{RESET}')
+            else:
+                # Still show shape type as flavour even without world data
+                rng = random.Random(int(hashlib.sha256(f'sigil:{target}'.encode()).hexdigest(),16))
+                shape = rng.choice(['polygon','star','orbital','rune'])
+                print(f'  {DIM_C}sigil type: {shape}{RESET}')
+            print_sep('─')
+        else:
+            if not self.users:
+                print_sys('No users online', DIM_C); return
+            print_sys(f'{len(self.users)} online  (use /users <name> for profile):', ACCENT)
+            for name, clr in sorted(self.users.items()):
+                marker = '▶ ' if name == self.username else '  '
+                print(f'  {DIM_C}{marker}{RESET}{color_name(name, clr)}')
 
     def show_world(self):
         w = self.world
@@ -522,8 +635,9 @@ def input_loop(session):
 
         if line.lower() in ('/quit', '/q', '/exit'):
             break
-        elif line.lower() == '/users':
-            session.show_users()
+        elif line.lower().startswith('/users'):
+            parts = line.split(None, 1)
+            session.show_users(parts[1] if len(parts) > 1 else None)
         elif line.lower() == '/world':
             session.show_world()
         elif line.lower() == '/clear':
