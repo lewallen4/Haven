@@ -2352,11 +2352,24 @@ class HavenClient:
         self.root.geometry(f"{ww}x{wh}+{sw//2-ww//2}+{sh//2-wh//2}")
         self.root.minsize(800, 500)
         self.root.resizable(True, True)
-        self.root.overrideredirect(True)
+        _IS_LINUX = sys.platform.startswith('linux')
+        if _IS_LINUX:
+            # On Linux/X11, overrideredirect(True) prevents the WM from routing
+            # keyboard events — the window renders but can't receive typing.
+            # Use splash/override window type instead: borderless but focusable.
+            try:
+                self.root.wm_attributes('-type', 'splash')
+            except Exception:
+                pass  # Wayland or older X11 — fall back gracefully
+        else:
+            self.root.overrideredirect(True)
         self.root.lift()
         self.root.focus_force()
         self.root.attributes('-topmost', True)
         self.root.after(100, lambda: self.root.attributes('-topmost', False))
+        if _IS_LINUX:
+            # Re-request focus after event loop settles on Linux
+            self.root.after(200, lambda: self.root.focus_force())
         self.root.configure(bg=self.theme['bg_color'])
         apply_window_icon(self.root)
 
@@ -2793,6 +2806,14 @@ class HavenClient:
                 self._saved_win_w = event.width
                 self._saved_win_h = event.height
         self.root.bind('<Configure>', _on_resize)
+
+        # On Linux: re-focus the entry widget whenever the window gets focus
+        # (compensates for WM occasionally stealing focus back)
+        if sys.platform.startswith('linux'):
+            def _linux_focus_fix(e):
+                if self.msg_entry and self.msg_entry.winfo_exists():
+                    self.root.after(50, self.msg_entry.focus_set)
+            self.root.bind('<FocusIn>', _linux_focus_fix)
 
         # ── Edge/corner resize handles for overrideredirect window ────────────
         GRIP = 6  # px — invisible hit area on each edge
@@ -4056,10 +4077,10 @@ class HavenClient:
 
             # Sigil — rendered from SVG as a PhotoImage via base64 PNG fallback
             # We draw the sigil on a small canvas using tkinter geometry
-            sigil_canvas = tk.Canvas(inner, width=28, height=28,
+            sigil_canvas = tk.Canvas(inner, width=44, height=44,
                                      bg=t['userlist_card_bg'], highlightthickness=0)
             sigil_canvas.pack(side=tk.LEFT, padx=(0, 6))
-            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=28)
+            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=44)
             self._sigil_canvases[username] = (sigil_canvas, color)
 
             right = tk.Frame(inner, bg=t['userlist_card_bg'])
@@ -4224,29 +4245,26 @@ class HavenClient:
             self._sparkle_sigil(canvas, username, color, _frames=0)
             return
 
-        size   = 28
+        size   = 44
         cx, cy = size / 2, size / 2
         phase  = _phase  # unbounded, wraps naturally in trig
 
         canvas.delete('all')
 
-        # ── Outward glow rings ────────────────────────────────────────────────
-        # Two rings, offset in phase, expanding outward and fading
+        # ── Outward glow rings — start inside sigil boundary, expand outward ──
         for ring_offset in [0, 15]:
             ring_phase = (phase + ring_offset) % 30
-            # Radius grows from 10 → 18 over 30 frames
-            r_min, r_max = 10, 18
+            # Radius grows from 14 → 21 over 30 frames (stays within 44px canvas)
+            r_min, r_max = 14, 21
             ring_r  = r_min + (r_max - r_min) * (ring_phase / 30)
-            # Alpha fades from 0.5 → 0 as ring expands
-            ring_alpha = 0.5 * (1.0 - ring_phase / 30)
+            # Alpha fades from 0.55 → 0 as ring expands
+            ring_alpha = 0.55 * (1.0 - ring_phase / 30)
             ring_color = self._color_with_alpha(color, ring_alpha)
-            # Draw as thick oval outline
             thickness = max(1, int(3 * (1.0 - ring_phase / 30)))
             canvas.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
                                outline=ring_color, width=thickness)
 
         # ── Rotating sigil ────────────────────────────────────────────────────
-        # Boost color slightly while speaking
         speak_color = self._boost_color(color, 1.3)
         rotation_deg = (phase * 3) % 360  # 3 deg/frame = ~1 full rotation/2 sec
         self._draw_sigil_on_canvas(canvas, username, speak_color, size=size,
@@ -4263,7 +4281,7 @@ class HavenClient:
         if username in self.active_speakers: return  # started speaking again
 
         TOTAL_FRAMES = 20
-        size = 28; cx = size / 2; cy = size / 2
+        size = 44; cx = size / 2; cy = size / 2
 
         canvas.delete('all')
 
@@ -4275,7 +4293,7 @@ class HavenClient:
             n_sparks = 8
             for i in range(n_sparks):
                 angle = math.radians(i * 360 / n_sparks)
-                dist  = 4 + 10 * progress   # 4 → 14 px from center
+                dist  = 6 + 15 * progress   # 6 → 21 px from center (fits 44px canvas)
                 sx    = cx + dist * math.cos(angle)
                 sy    = cy + dist * math.sin(angle)
                 alpha = 1.0 - progress       # fade out
