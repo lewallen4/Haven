@@ -240,9 +240,20 @@ def _open_sfx_stream():
         print(f'[AUDIO] PyAudio SFX stream failed: {e}')
         _sfx_ready = False
 
+_sfx_volume_ref = [100]  # mutable ref updated by play_sound with the app's sfx_volume
+
 def _play_pcm(pcm: bytes):
     """Write raw PCM to the shared output stream. Called on a per-sound thread."""
     global _sfx_stream, _sfx_ready
+    # Apply SFX master volume
+    vol = _sfx_volume_ref[0] / 100.0
+    if vol != 1.0:
+        try:
+            import numpy as np
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            pcm = (arr * min(vol, 2.0)).clip(-32768, 32767).astype(np.int16).tobytes()
+        except ImportError:
+            pass
     if not _sfx_ready or _sfx_stream is None:
         return
     try:
@@ -274,12 +285,14 @@ def _ensure_sfx_ready():
         threading.Thread(target=_open_sfx_stream, daemon=True,
                          name='HavenSFXInit').start()
 
-def play_sound(name: str, enabled: bool = True):
+def play_sound(name: str, enabled: bool = True, sfx_vol: int = None):
     """Fire-and-forget PCM playback via PyAudio. Near-zero latency, overlapping."""
     if not enabled:
         return
     if name not in _sound_pcm:
         return
+    if sfx_vol is not None:
+        _sfx_volume_ref[0] = sfx_vol
     _ensure_sfx_ready()
     threading.Thread(target=_play_pcm_threaded, args=(name,), daemon=True,
                      name=f'HavenSFX_{name}').start()
@@ -1545,59 +1558,134 @@ class AudioDeviceDialog(tk.Toplevel):
 
     def test_input_device(self):
         try:
-            device_name = self.input_var.get(); device_index = None
+            # Input device
+            device_name  = self.input_var.get(); in_idx = None
             if not device_name.startswith("Default"):
-                try: device_index = int(device_name.split("Device ")[1].split(":")[0])
+                try: in_idx = int(device_name.split("Device ")[1].split(":")[0])
                 except: pass
-            stream = None; used_rate = None
+
+            # Output device (for loopback)
+            out_name = self.output_var.get(); out_idx = None
+            if not out_name.startswith("Default"):
+                try: out_idx = int(out_name.split("Device ")[1].split(":")[0])
+                except: pass
+
+            stream_in = None; stream_out = None; used_rate = None
             for rate in SUPPORTED_RATES:
                 try:
-                    stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
-                                         input=True, input_device_index=device_index,
-                                         frames_per_buffer=CHUNK)
+                    stream_in = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
+                                            input=True, input_device_index=in_idx,
+                                            frames_per_buffer=CHUNK)
                     used_rate = rate; break
                 except: continue
-            if stream is None: raise Exception("Could not open device at any sample rate")
+            if stream_in is None: raise Exception("Could not open input device at any sample rate")
+
+            # Open matching output for loopback
+            for rate in [used_rate] + [r for r in SUPPORTED_RATES if r != used_rate]:
+                try:
+                    stream_out = self.p.open(format=FORMAT, channels=CHANNELS, rate=rate,
+                                             output=True, output_device_index=out_idx,
+                                             frames_per_buffer=CHUNK)
+                    break
+                except: continue
+
+            loopback_enabled = [stream_out is not None]
 
             test_dialog = tk.Toplevel(self)
-            test_dialog.configure(bg=self.t['glass_bg']); test_dialog.geometry("300x220")
+            test_dialog.configure(bg=self.t['glass_bg'])
             test_dialog.overrideredirect(True)
             apply_window_icon(test_dialog)
             build_themed_titlebar(test_dialog, self.t, "Microphone Test",
                                   on_close=lambda: close_test())
             x = (self.winfo_screenwidth() // 2) - 150
-            y = (self.winfo_screenheight() // 2) - 110
-            test_dialog.geometry(f'300x220+{x}+{y}')
+            y = (self.winfo_screenheight() // 2) - 130
+            test_dialog.geometry(f'300x260+{x}+{y}')
+
             tk.Label(test_dialog, text="🎤 Testing Microphone", bg=self.t['glass_bg'],
-                     fg=self.t['accent_1'], font=('Segoe UI', 12, 'bold')).pack(pady=20)
+                     fg=self.t['accent_1'], font=('Segoe UI', 12, 'bold')).pack(pady=(18, 4))
             tk.Label(test_dialog, text=f"Sample Rate: {used_rate} Hz",
-                     bg=self.t['glass_bg'], fg=self.t['fg_color'], font=('Segoe UI', 9)).pack(pady=5)
-            vu_label = tk.Label(test_dialog, text="●", bg=self.t['glass_bg'],
-                                fg=self.t['accent_1'], font=('Segoe UI', 20))
+                     bg=self.t['glass_bg'], fg=self.t['fg_color'],
+                     font=('Segoe UI', 9)).pack()
+
+            # VU meter
+            vu_label = tk.Label(test_dialog, text="●●●●●●●●●●",
+                                bg=self.t['glass_bg'], fg=self.t['glass_accent'],
+                                font=('Segoe UI', 14))
             vu_label.pack(pady=10)
 
-            def update_vu():
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                    max_val = max(abs(int.from_bytes(data[i:i+2], 'little', signed=True))
-                                  for i in range(0, len(data), 2))
-                    vol = min(100, max_val // 100)
-                    vu_label.config(fg=(self.t['accent_1'] if vol < 30
-                                        else (self.t['accent_4'] if vol < 70
-                                              else self.t['accent_2'])))
-                    test_dialog.after(50, update_vu)
-                except: pass
+            # Loopback toggle
+            loop_var = tk.BooleanVar(value=loopback_enabled[0])
+            loop_row = tk.Frame(test_dialog, bg=self.t['glass_bg'])
+            loop_row.pack()
+            tk.Label(loop_row, text="Hear yourself:", bg=self.t['glass_bg'],
+                     fg=self.t['fg_color'], font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0,6))
+            loop_status = tk.Label(loop_row,
+                                   text=("ON" if loopback_enabled[0] else "No output device"),
+                                   bg=self.t['glass_bg'],
+                                   fg=(self.t['accent_1'] if loopback_enabled[0] else self.t['accent_4']),
+                                   font=('Segoe UI', 9, 'bold'))
+            loop_status.pack(side=tk.LEFT)
+            if loopback_enabled[0]:
+                def toggle_loopback():
+                    loopback_enabled[0] = not loopback_enabled[0]
+                    loop_status.config(
+                        text="ON" if loopback_enabled[0] else "OFF",
+                        fg=self.t['accent_1'] if loopback_enabled[0] else self.t['accent_4']
+                    )
+                tk.Checkbutton(loop_row, variable=loop_var,
+                               bg=self.t['glass_bg'], activebackground=self.t['glass_bg'],
+                               selectcolor=self.t['glass_accent'], relief=tk.FLAT,
+                               command=toggle_loopback).pack(side=tk.LEFT, padx=4)
 
-            update_vu()
+            running = [True]
+
+            def _loopback_thread():
+                while running[0]:
+                    try:
+                        data = stream_in.read(CHUNK, exception_on_overflow=False)
+                        # VU update via after
+                        try:
+                            vals = [abs(int.from_bytes(data[i:i+2], 'little', signed=True))
+                                    for i in range(0, min(len(data), 64), 2)]
+                            peak = max(vals) if vals else 0
+                            test_dialog.after(0, lambda p=peak: _update_vu(p))
+                        except: pass
+                        # Loopback
+                        if loopback_enabled[0] and stream_out:
+                            try:
+                                vol = self.output_volume.get() / 100
+                                if vol != 1.0:
+                                    try:
+                                        import numpy as np
+                                        arr = np.frombuffer(data, dtype=np.int16)
+                                        data = (arr * vol).astype(np.int16).tobytes()
+                                    except ImportError: pass
+                                stream_out.write(data)
+                            except: pass
+                    except: break
+
+            def _update_vu(peak):
+                if not test_dialog.winfo_exists(): return
+                level = min(10, peak // 3000)
+                lit   = self.t['accent_1']
+                dim   = self.t['glass_accent']
+                vu_label.config(text='●' * level + '○' * (10 - level),
+                                fg=lit if level > 6 else (self.t['accent_4'] if level > 3 else dim))
+
+            threading.Thread(target=_loopback_thread, daemon=True).start()
 
             def close_test():
-                try: stream.stop_stream(); stream.close()
+                running[0] = False
+                try: stream_in.stop_stream();  stream_in.close()
                 except: pass
+                if stream_out:
+                    try: stream_out.stop_stream(); stream_out.close()
+                    except: pass
                 test_dialog.destroy()
 
             tk.Button(test_dialog, text="STOP TEST", bg=self.t['accent_2'], fg='#fff',
                       font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
-                      command=close_test, padx=20, pady=5).pack(pady=10)
+                      command=close_test, padx=20, pady=5).pack(pady=14)
         except Exception as e:
             messagebox.showerror("Test Failed", f"Could not test microphone: {str(e)}")
 
@@ -1725,6 +1813,423 @@ class AboutDialog(tk.Toplevel):
 # Main client
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOUND SETTINGS DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SoundSettingsDialog(tk.Toplevel):
+    """
+    Sound settings panel — enabled toggle, SFX master volume, per-user voice volume.
+    """
+
+    def __init__(self, parent, theme, sounds_enabled, sfx_volume, user_volumes,
+                 known_users, on_save):
+        super().__init__(parent)
+        self.t       = theme
+        self.on_save = on_save
+        self.overrideredirect(True)
+        self.configure(bg=theme['accent_4'])
+        apply_window_icon(self)
+
+        t = self.t
+        build_themed_titlebar(self, t, "Sound Settings", on_close=self.destroy)
+
+        outer = tk.Frame(self, bg=t['glass_bg'], highlightthickness=0)
+        outer.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
+
+        self._enabled_var = tk.BooleanVar(value=sounds_enabled)
+        self._sfx_var     = tk.IntVar(value=int(sfx_volume))
+
+        tk.Label(outer, text="SOUND SETTINGS", bg=t['glass_bg'], fg=t['accent_4'],
+                 font=('Segoe UI', 8, 'bold')).pack(anchor='w', padx=16, pady=(14, 4))
+        tk.Frame(outer, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, padx=16, pady=(0, 8))
+
+        # Enabled toggle
+        en_row = tk.Frame(outer, bg=t['glass_bg'])
+        en_row.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(en_row, text="Sounds Enabled", bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 9), width=18, anchor='w').pack(side=tk.LEFT)
+        tk.Checkbutton(en_row, variable=self._enabled_var,
+                       bg=t['glass_bg'], fg=t['fg_color'],
+                       activebackground=t['glass_bg'], selectcolor=t['glass_accent'],
+                       relief=tk.FLAT).pack(side=tk.LEFT)
+
+        # SFX master volume
+        sfx_row = tk.Frame(outer, bg=t['glass_bg'])
+        sfx_row.pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(sfx_row, text="SFX Volume", bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 9), width=18, anchor='w').pack(side=tk.LEFT)
+        sfx_val = tk.Label(sfx_row, text=f"{int(sfx_volume)}%", bg=t['glass_bg'],
+                           fg=t['accent_1'], font=('Segoe UI', 9), width=5)
+        sfx_val.pack(side=tk.RIGHT)
+        tk.Scale(sfx_row, from_=0, to=200, orient=tk.HORIZONTAL, variable=self._sfx_var,
+                 bg=t['glass_bg'], fg=t['fg_color'], troughcolor=t['glass_accent'],
+                 highlightthickness=0, showvalue=False, length=140,
+                 command=lambda v: sfx_val.config(text=f"{int(float(v))}%")).pack(side=tk.LEFT, padx=(8, 4))
+
+        # Per-user voice volumes
+        self._user_vars = {}
+        if known_users:
+            tk.Frame(outer, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, padx=16, pady=(10, 6))
+            tk.Label(outer, text="PER-USER VOICE VOLUME", bg=t['glass_bg'], fg=t['accent_4'],
+                     font=('Segoe UI', 8, 'bold')).pack(anchor='w', padx=16)
+
+            sc = tk.Frame(outer, bg=t['glass_bg'])
+            sc.pack(fill=tk.BOTH, expand=True, padx=16, pady=(6, 4))
+
+            h = min(200, len(known_users) * 38)
+            canvas = tk.Canvas(sc, bg=t['glass_bg'], highlightthickness=0, height=h)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            if len(known_users) > 5:
+                sb = make_scrollbar(sc, t, orient=tk.VERTICAL, command=canvas.yview)
+                sb.pack(side=tk.RIGHT, fill=tk.Y)
+                canvas.configure(yscrollcommand=sb.set)
+
+            uf = tk.Frame(canvas, bg=t['glass_bg'])
+            canvas.create_window((0, 0), window=uf, anchor='nw')
+            uf.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+            for uname in known_users:
+                vol = user_volumes.get(uname, 100)
+                var = tk.IntVar(value=int(vol))
+                self._user_vars[uname] = var
+                row = tk.Frame(uf, bg=t['glass_bg'])
+                row.pack(fill=tk.X, pady=2)
+                tk.Label(row, text=uname, bg=t['glass_bg'], fg=t['fg_color'],
+                         font=('Segoe UI', 9), width=14, anchor='w').pack(side=tk.LEFT)
+                vl = tk.Label(row, text=f"{int(vol)}%", bg=t['glass_bg'],
+                              fg=t['accent_1'], font=('Segoe UI', 9), width=5)
+                vl.pack(side=tk.RIGHT)
+                tk.Scale(row, from_=0, to=200, orient=tk.HORIZONTAL, variable=var,
+                         bg=t['glass_bg'], fg=t['fg_color'], troughcolor=t['glass_accent'],
+                         highlightthickness=0, showvalue=False, length=120,
+                         command=lambda v, lbl=vl: lbl.config(text=f"{int(float(v))}%")).pack(side=tk.LEFT, padx=(8,4))
+        else:
+            tk.Label(outer, text="(No users seen this session yet)",
+                     bg=t['glass_bg'], fg=t['accent_4'],
+                     font=('Segoe UI', 8, 'italic')).pack(padx=16, pady=8, anchor='w')
+
+        # Buttons
+        tk.Frame(outer, bg=t['titlebar_sep'], height=1).pack(fill=tk.X, padx=16, pady=(10, 6))
+        btn_row = tk.Frame(outer, bg=t['glass_bg'])
+        btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
+        tk.Button(btn_row, text="SAVE", bg=t['accent_1'], fg=t['send_btn_fg'],
+                  font=('Segoe UI', 9, 'bold'), relief=tk.FLAT, padx=16, pady=4,
+                  command=self._save).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(btn_row, text="Cancel", bg=t['glass_accent'], fg=t['fg_color'],
+                  font=('Segoe UI', 9), relief=tk.FLAT, padx=16, pady=4,
+                  command=self.destroy).pack(side=tk.RIGHT)
+
+        self.withdraw()          # hide while measuring
+        self.update_idletasks()
+        self.update_idletasks()  # second pass — overrideredirect windows need it
+        w  = max(self.winfo_reqwidth(),  self.winfo_width())
+        h2 = max(self.winfo_reqheight(), self.winfo_height())
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x  = sw // 2 - w // 2
+        y  = sh // 2 - h2 // 2
+        self.geometry(f"{w}x{h2}+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
+        self.grab_set()
+
+    def _save(self):
+        self.on_save(
+            self._enabled_var.get(),
+            int(self._sfx_var.get()),
+            {u: int(v.get()) for u, v in self._user_vars.items()}
+        )
+        self.destroy()
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LORE BOOK DIALOG
+# A tabbed paged book showing the world's living mythology.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LoreBookDialog(tk.Toplevel):
+    """
+    The Lore Book — tabs as page tabs, themed, centered on screen.
+    Pages: The Record | Souls | Bonds | Legends | The Deep Record
+    """
+
+    PAGES = ["The Record", "Souls", "Bonds", "Legends", "The Deep Record"]
+
+    def __init__(self, parent, theme, summary, own_identity):
+        super().__init__(parent)
+        self.t           = theme
+        self.summary     = summary
+        self.own_identity = own_identity
+        self._current    = 0
+
+        self.overrideredirect(True)
+        self.configure(bg=theme['accent_4'])
+        apply_window_icon(self)
+
+        t = self.t
+        build_themed_titlebar(self, t, "✦  The Lore Book", on_close=self.destroy)
+
+        outer = tk.Frame(self, bg=t['glass_bg'], highlightthickness=0)
+        outer.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
+
+        # ── Tab row ───────────────────────────────────────────────────────────
+        tab_row = tk.Frame(outer, bg=t['glass_accent'])
+        tab_row.pack(fill=tk.X, padx=0, pady=0)
+
+        self._tab_btns = []
+        for i, name in enumerate(self.PAGES):
+            btn = tk.Label(tab_row, text=name,
+                           bg=t['glass_accent'], fg=t['accent_4'],
+                           font=('Segoe UI', 8), padx=10, pady=5, cursor='hand2')
+            btn.pack(side=tk.LEFT)
+            btn.bind('<Button-1>', lambda e, idx=i: self._switch_page(idx))
+            btn.bind('<Enter>', lambda e, b=btn: b.config(fg=t['fg_color']) if b != self._tab_btns[self._current] else None)
+            btn.bind('<Leave>', lambda e, b=btn, idx2=i: b.config(fg=(t['send_btn_fg'] if idx2 == self._current else t['accent_4'])))
+            self._tab_btns.append(btn)
+
+        tk.Frame(outer, bg=t['accent_4'], height=1).pack(fill=tk.X)
+
+        # ── Page area ─────────────────────────────────────────────────────────
+        self._page_frame = tk.Frame(outer, bg=t['glass_bg'], width=420, height=480)
+        self._page_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        self._page_frame.pack_propagate(False)
+
+        # Close is handled by the titlebar X button
+
+        self._switch_page(0)
+
+        self.withdraw()
+        self.update_idletasks()
+        self.update_idletasks()
+        w  = max(self.winfo_reqwidth(), 440)
+        h2 = max(self.winfo_reqheight(), 560)
+        sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h2}+{sw//2 - w//2}+{sh//2 - h2//2}")
+        self.deiconify()
+        self.lift()
+        self.attributes('-topmost', True)
+        self.after(100, lambda: self.attributes('-topmost', False))
+        self.grab_set()
+
+    def _switch_page(self, idx):
+        t = self.t
+        self._current = idx
+        # Update tab styling
+        for i, btn in enumerate(self._tab_btns):
+            if i == idx:
+                btn.config(bg=t['glass_bg'], fg=t['send_btn_fg'],
+                           font=('Segoe UI', 8, 'bold'))
+            else:
+                btn.config(bg=t['glass_accent'], fg=t['accent_4'],
+                           font=('Segoe UI', 8))
+
+        for w in self._page_frame.winfo_children():
+            w.destroy()
+
+        # Scrollable content area
+        canvas = tk.Canvas(self._page_frame, bg=t['glass_bg'],
+                           highlightthickness=0, bd=0)
+        sb = make_scrollbar(self._page_frame, t, orient=tk.VERTICAL, command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        canvas.configure(yscrollcommand=sb.set)
+
+        content = tk.Frame(canvas, bg=t['glass_bg'])
+        cwin = canvas.create_window((0, 0), window=content, anchor='nw')
+        content.bind('<Configure>', lambda e: canvas.configure(
+            scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(cwin, width=e.width))
+
+        # Mousewheel — scoped to canvas only, guarded against destroyed widget
+        def _mw(event):
+            if canvas.winfo_exists():
+                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind('<MouseWheel>', _mw)
+        content.bind('<MouseWheel>', _mw)
+
+        # Build page
+        builders = [
+            self._page_record,
+            self._page_souls,
+            self._page_bonds,
+            self._page_legends,
+            self._page_deep_record,
+        ]
+        builders[idx](content)
+
+    def _lbl(self, parent, text, color=None, bold=False, italic=False,
+             pady=4, padx=16, wrap=380, size=8):
+        t = self.t
+        style = 'bold italic' if bold and italic else 'bold' if bold else 'italic' if italic else 'normal'
+        tk.Label(parent, text=text, bg=t['glass_bg'],
+                 fg=color or t['fg_color'],
+                 font=('Segoe UI', size, style), wraplength=wrap,
+                 padx=padx, pady=pady, justify='left', anchor='w').pack(fill=tk.X)
+
+    def _sep(self, parent):
+        tk.Frame(parent, bg=self.t['accent_4'], height=1).pack(
+            fill=tk.X, padx=16, pady=6)
+
+    def _head(self, parent, text):
+        self._lbl(parent, text, color=self.t.get('accent_1','#00ff88'),
+                  bold=True, size=9, pady=10)
+
+    def _page_record(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  THE RECORD")
+        self._lbl(p, s.get('world_age',''), italic=True)
+        self._lbl(p, s.get('season',''), color=t.get('accent_1'))
+        self._sep(p)
+
+        soul_counts = s.get('soul_counts', {})
+        mortals  = soul_counts.get('mortal', 0)
+        seraphs  = soul_counts.get('seraph', 0)
+        daemons  = soul_counts.get('daemon', 0)
+        self._lbl(p, f"{s.get('total_souls',0)} souls have passed through this world.", bold=True)
+        if seraphs: self._lbl(p, f"Of these, {seraphs} are of Seraphic nature.", italic=True)
+        if daemons: self._lbl(p, f"{daemons} are of Daemonic nature.", italic=True)
+        if mortals: self._lbl(p, f"{mortals} are mortal.")
+        self._sep(p)
+
+        self._lbl(p, f"{s.get('total_bonds',0)} bonds have been recorded between souls.", italic=True)
+        self._lbl(p, f"{s.get('total_events',0)} events are in the record.")
+        choir = s.get('choir_count', 0)
+        if choir:
+            self._lbl(p, f"The Choir has convened {choir} time{'s' if choir > 1 else ''}.", italic=True,
+                     color=t.get('accent_1'))
+        self._sep(p)
+        self._head(p, "RECENT RECORD")
+        for line in s.get('recent_lore', []):
+            self._lbl(p, line, italic=True, color=t['accent_4'], pady=2)
+
+        own = self.own_identity
+        if own:
+            self._sep(p)
+            self._head(p, "YOUR RECORD")
+            soul = own.get('soul_type', 'mortal')
+            soul_label = {'seraph': '✦ Seraph', 'daemon': '⬡ Daemon', 'mortal': '· Mortal'}.get(soul, soul)
+            self._lbl(p, soul_label, color=t.get('accent_1'), bold=True, pady=2)
+            self._lbl(p, own.get('title',''), bold=True, pady=2)
+            self._lbl(p, own.get('origin',''), pady=2)
+            if own.get('faction'): self._lbl(p, own['faction'], italic=True, pady=2)
+            if own.get('trait'): self._lbl(p, f'"{own["trait"]}"', italic=True,
+                                            color=t['fg_color'], pady=4)
+
+    def _page_souls(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  THE SOULS")
+        all_users = s.get('all_users', [])
+        if not all_users:
+            self._lbl(p, "No souls recorded yet.", italic=True, color=t['accent_4'])
+            return
+        self._lbl(p, f"{len(all_users)} souls in the record.", italic=True, pady=2)
+        self._sep(p)
+        soul_icons = {'seraph': '✦', 'daemon': '⬡', 'mortal': '·'}
+        for u in all_users:
+            soul  = u.get('soul_type', 'mortal')
+            icon  = soul_icons.get(soul, '·')
+            uname = u.get('username', '')
+            self._lbl(p, f"{icon}  {uname}", bold=True, pady=8,
+                     color={'seraph': t.get('accent_1','#00ff88'),
+                             'daemon': t.get('accent_2','#cc4444'),
+                             'mortal': t['fg_color']}.get(soul, t['fg_color']))
+            if u.get('title'): self._lbl(p, u['title'], pady=1, color=t['accent_4'])
+            if u.get('origin'): self._lbl(p, u['origin'], pady=1, color=t['accent_4'])
+            if u.get('faction'): self._lbl(p, u['faction'], italic=True, pady=1, color=t['accent_4'])
+            if u.get('trait'): self._lbl(p, f'"{u["trait"]}"', italic=True, pady=4)
+            tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=1)
+
+    def _page_bonds(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  BONDS & ALLIANCES")
+        all_bonds = s.get('all_bonds', [])
+        if not all_bonds:
+            self._lbl(p, "No bonds have formed yet.", italic=True, color=t['accent_4'])
+            self._lbl(p, "Bonds form when souls meet more than once in the same region.",
+                     italic=True, color=t['accent_4'], pady=2)
+            return
+        self._lbl(p, f"{len(all_bonds)} bonds in the record.", italic=True, pady=2)
+        self._sep(p)
+        for bond in all_bonds:
+            a = bond.get('a',''); b = bond.get('b','')
+            count  = bond.get('count', 0)
+            region = bond.get('region','')
+            depth  = "Deep bond" if count >= 5 else "Known to each other"
+            self._lbl(p, f"{a}  ·  {b}", bold=True, pady=8, color=t.get('accent_1'))
+            self._lbl(p, f"{depth}  ·  {count} meeting{'s' if count > 1 else ''}", pady=1,
+                     color=t['accent_4'])
+            if region: self._lbl(p, f"Last in {region}", italic=True, pady=1, color=t['accent_4'])
+            tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=1)
+
+    def _page_legends(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  LEGENDS & HAUNTINGS")
+
+        legends = s.get('all_legends', [])
+        if legends:
+            self._lbl(p, "— regional legends —", italic=True, color=t['accent_4'], pady=2)
+            for leg in legends:
+                self._lbl(p, leg, italic=True, pady=4)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+
+        ghosts = s.get('all_ghosts', [])
+        if ghosts:
+            self._sep(p)
+            self._lbl(p, "— from the ghost records —", italic=True,
+                     color=t.get('accent_2','#cc4444'), pady=2)
+            for tale in ghosts:
+                self._lbl(p, tale, italic=True, color=t.get('accent_2','#cc4444'), pady=4)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+
+        if not legends and not ghosts:
+            self._lbl(p, "The world is young. No legends have formed yet.", italic=True,
+                     color=t['accent_4'])
+            self._lbl(p, "Legends emerge when regions accumulate enough history.",
+                     italic=True, color=t['accent_4'], pady=2)
+            self._lbl(p, "Ghost tales appear when souls have been absent for more than 7 days.",
+                     italic=True, color=t['accent_4'], pady=2)
+
+    def _page_deep_record(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  THE DEEP RECORD")
+        self._lbl(p, "A complete account of what the world has witnessed.", italic=True,
+                 color=t['accent_4'], pady=2)
+        self._sep(p)
+
+        events = s.get('full_events', [])
+        if not events:
+            self._lbl(p, "The record is empty.", italic=True, color=t['accent_4'])
+            return
+
+        import time as _time
+        type_colors = {
+            'first_arrival': t.get('accent_1','#00ff88'),
+            'arrival':       t['fg_color'],
+            'return':        t.get('accent_1','#00ff88'),
+            'departure':     t['accent_4'],
+            'silence':       t['accent_4'],
+            'gathering':     t.get('accent_1','#00ff88'),
+            'choir':         t.get('accent_1','#00ff88'),
+        }
+        for e in reversed(events):
+            etype = e.get('type','')
+            ts    = e.get('timestamp', 0)
+            color = type_colors.get(etype, t['fg_color'])
+            if ts:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
+                self._lbl(p, dt, color=t['accent_4'], size=7, pady=6)
+            self._lbl(p, e.get('text',''), color=color, italic=True, pady=1)
+            for extra in e.get('extra', []):
+                self._lbl(p, extra, color=t['accent_4'], italic=True, pady=1)
+
+
 class HavenClient:
     def __init__(self):
         self.root = tk.Tk()
@@ -1738,7 +2243,12 @@ class HavenClient:
         self.tray_icon   = None
         self.open_mic_active = False
         self.session_crypto  = None   # SessionCrypto — set after PQ handshake
-        self._online_users   = []        # last userlist_full payload — used for theme rebuild
+        self._last_send_time = 0.0       # throttle key-repeat sends
+        self._online_users      = []        # last userlist_full payload — used for theme rebuild
+        self._world_identities  = {}        # username → world identity dict (expansion worlds)
+        self._sigil_canvases    = {}        # username → sigil tk.Canvas for glow effect
+        self._world_summary     = None      # latest world summary from server
+        self._expansion_enabled = False     # whether server has expansion worlds on
         self.saved_wire_hash = None   # SHA256(password) for reconnect — never plaintext
 
         # UI widget refs (set in build_ui, cleared in rebuild_ui)
@@ -1766,6 +2276,8 @@ class HavenClient:
         self.theme_name = config.get('theme', 'default')
         self.theme      = load_theme(self.theme_name)
         self.sounds_enabled     = config.get('sounds_enabled', True)
+        self.sfx_volume         = config.get('sfx_volume', 100)
+        self.user_volumes       = config.get('user_volumes', {})
         self.ptt_release_delay  = config.get('ptt_release_delay', 0.0)
         self._saved_win_w       = config.get('window_w', 900)
         self._saved_win_h       = config.get('window_h', 850)
@@ -1922,7 +2434,7 @@ class HavenClient:
         self.speaker_labels = {}
         self._images = []
 
-        self.root.configure(bg=self.theme['bg_color'])
+        self.root.configure(bg=self.theme['accent_4'])
         self.build_ui()
 
         # Replay structured message log directly to _render_* to avoid re-logging
@@ -2152,6 +2664,8 @@ class HavenClient:
             'input_volume':        self.audio_settings.get('input_volume', 100),
             'output_volume':       self.audio_settings.get('output_volume', 100),
             'sounds_enabled':      getattr(self, 'sounds_enabled', True),
+            'sfx_volume':          getattr(self, 'sfx_volume', 100),
+            'user_volumes':        getattr(self, 'user_volumes', {}),
             'ptt_release_delay':   getattr(self, 'ptt_release_delay', 0.0),
             'window_w':            getattr(self, '_saved_win_w', 900),
             'window_h':            getattr(self, '_saved_win_h', 850),
@@ -2285,7 +2799,7 @@ class HavenClient:
 
         def _make_grip(cursor, resize_fn):
             """Create an invisible resize strip with the given cursor."""
-            f = tk.Frame(self.root, bg=t['bg_color'], cursor=cursor)
+            f = tk.Frame(self.root, bg=t['accent_4'], cursor=cursor)
             f.lift()
             f._rx = f._ry = f._rw = f._rh = None
             def _rs(e):
@@ -2369,6 +2883,22 @@ class HavenClient:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_text.config(yscrollcommand=scrollbar.set)
 
+        # Sparkle lore-book button — tiny, bottom-right corner of the whole window
+        # Sparkle lore-book button — tiny Canvas so we can clip the right edge
+        # by making the canvas 2px narrower than the emoji (right side clips naturally)
+        self._sparkle_btn = tk.Canvas(self.root, width=14, height=16,
+                                      bg=t['glass_bg'], highlightthickness=0,
+                                      cursor='hand2')
+        self._sparkle_btn.create_text(0, 8, text="✨", anchor='w',
+                                      font=('Segoe UI', 8),
+                                      fill=t['accent_4'], tags='icon')
+        self._sparkle_btn.place(relx=1.0, rely=1.0, x=-2, y=-4, anchor='se')
+        self._sparkle_btn.place(relx=1.0, rely=1.0, x=-4, y=-4, anchor='se')
+        self._sparkle_btn.bind('<Button-1>', lambda e: self._open_lore_book())
+        self._sparkle_btn.bind('<Enter>',  lambda e: self._sparkle_btn.itemconfig('icon', fill=t['accent_1']))
+        self._sparkle_btn.bind('<Leave>',  lambda e: self._sparkle_btn.itemconfig('icon', fill=t['accent_4']))
+        self.root.after(100, lambda: tk.Misc.lift(self._sparkle_btn))
+
         # ── Message entry row ─────────────────────────────────────────────
         entry_container = tk.Frame(left_frame, bg=t['glass_accent'], height=50)
         entry_container.pack(fill=tk.X)
@@ -2450,11 +2980,172 @@ class HavenClient:
 
         self.user_list_frame = tk.Frame(canvas, bg=t['userlist_bg'])
         canvas_window = canvas.create_window((0, 0), window=self.user_list_frame, anchor=tk.NW)
+
+        # World lore panel — collapsed by default, sits below the userlist
+        self._build_world_panel(right_frame)
         canvas.configure(yscrollcommand=scrollbar_users.set)
         self.user_list_frame.bind('<Configure>',
                                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind('<Configure>',
                     lambda e: canvas.itemconfig(canvas_window, width=e.width))
+
+    def _build_world_panel(self, parent):
+        """Collapsible world lore panel — sits at the bottom of the right sidebar."""
+        t = self.theme
+        self._world_panel_frame = tk.Frame(parent, bg=t['userlist_bg'])
+        self._world_panel_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=(0, 10))
+        self._world_panel_visible = False
+
+        header = tk.Frame(self._world_panel_frame, bg=t['glass_accent'],
+                          highlightthickness=1, highlightbackground=t['accent_4'])
+        header.pack(fill=tk.X)
+
+        # Left: toggle label
+        self._world_toggle_label = tk.Label(
+            header, text="✦  THE WORLD  ▸",
+            bg=t['glass_accent'], fg=t['accent_4'],
+            font=('Segoe UI', 7, 'bold'), anchor='w', padx=8, pady=4, cursor='hand2')
+        self._world_toggle_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._world_toggle_label.bind('<Button-1>', lambda e: self._toggle_world_panel())
+        header.bind('<Button-1>', lambda e: self._toggle_world_panel())
+
+        # Scrollable wrapper for world lore
+        self._world_lore_scroll_canvas = tk.Canvas(
+            self._world_panel_frame, bg=t['glass_accent'],
+            highlightthickness=0, height=220)
+        self._world_lore_scrollbar = make_scrollbar(
+            self._world_panel_frame, t, orient=tk.VERTICAL,
+            command=self._world_lore_scroll_canvas.yview)
+        self._world_lore_frame = tk.Frame(
+            self._world_lore_scroll_canvas, bg=t['glass_accent'])
+        self._world_lore_canvas_window = self._world_lore_scroll_canvas.create_window(
+            (0, 0), window=self._world_lore_frame, anchor='nw')
+        self._world_lore_scroll_canvas.configure(
+            yscrollcommand=self._world_lore_scrollbar.set)
+        self._world_lore_frame.bind('<Configure>', lambda e: (
+            self._world_lore_scroll_canvas.configure(
+                scrollregion=self._world_lore_scroll_canvas.bbox('all')),
+            self._world_lore_scroll_canvas.itemconfig(
+                self._world_lore_canvas_window,
+                width=self._world_lore_scroll_canvas.winfo_width())))
+        self._world_lore_scroll_canvas.bind('<Configure>', lambda e:
+            self._world_lore_scroll_canvas.itemconfig(
+                self._world_lore_canvas_window, width=e.width))
+        def _world_scroll(event):
+            if self._world_lore_scroll_canvas.winfo_exists():
+                self._world_lore_scroll_canvas.yview_scroll(
+                    int(-1*(event.delta/120)), 'units')
+        self._world_lore_scroll_canvas.bind('<MouseWheel>', _world_scroll)
+        self._world_lore_frame.bind('<MouseWheel>', _world_scroll)
+
+    def _toggle_world_panel(self):
+        if self._world_panel_visible:
+            self._world_lore_scroll_canvas.pack_forget()
+            self._world_lore_scrollbar.pack_forget()
+            self._world_toggle_label.config(text="✦  THE WORLD  ▸")
+            self._world_panel_visible = False
+        else:
+            self._world_lore_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            self._world_lore_scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self._world_toggle_label.config(text="✦  THE WORLD  ▾")
+            self._world_panel_visible = True
+            self._refresh_world_panel()
+
+    def _open_lore_book(self):
+        if not self._world_summary:
+            return
+        dialog = LoreBookDialog(self.root, self.theme, self._world_summary,
+                                self._world_identities.get(self.username, {}))
+        self.root.wait_window(dialog)
+
+    def _refresh_world_panel(self):
+        """Populate the world lore panel with current summary."""
+        if not hasattr(self, '_world_lore_frame') or not self._world_panel_visible:
+            return
+        t = self.theme
+        for w in self._world_lore_frame.winfo_children():
+            w.destroy()
+
+        summary = self._world_summary
+        if not summary:
+            tk.Label(self._world_lore_frame,
+                     text="Expansion Worlds not enabled on this server.",
+                     bg=t['glass_accent'], fg=t['accent_4'],
+                     font=('Segoe UI', 8), wraplength=160, padx=8, pady=6,
+                     justify='left').pack(fill=tk.X)
+            return
+
+        def lbl(text, color=None, bold=False, italic=False, pady=2, wrap=160):
+            font = ('Segoe UI', 7, ('bold italic' if bold and italic else 'bold' if bold else 'italic' if italic else 'normal'))
+            tk.Label(self._world_lore_frame, text=text,
+                     bg=t['glass_accent'], fg=color or t['accent_4'],
+                     font=font, wraplength=wrap, padx=8, pady=pady,
+                     justify='left', anchor='w').pack(fill=tk.X)
+
+        def sep():
+            tk.Frame(self._world_lore_frame, bg=t['accent_4'], height=1).pack(fill=tk.X, padx=8, pady=3)
+
+        souls       = summary.get('total_souls', 0)
+        events      = summary.get('total_events', 0)
+        bonds       = summary.get('total_bonds', 0)
+        choir_count = summary.get('choir_count', 0)
+        age         = summary.get('world_age', '')
+        season      = summary.get('season', '')
+        soul_counts = summary.get('soul_counts', {})
+
+        # ── Season & age ──────────────────────────────────────────────────────
+        if season:
+            lbl(season, color=t.get('accent_1', '#00ff88'), bold=True, pady=6)
+        if age:
+            lbl(age, italic=True, pady=1)
+
+        # Soul count line with soul type breakdown
+        soul_line = f"{souls} souls  ·  {bonds} bonds  ·  {events} events"
+        if soul_counts.get('seraph') or soul_counts.get('daemon'):
+            parts = []
+            if soul_counts.get('seraph'): parts.append(f"{soul_counts['seraph']} seraph")
+            if soul_counts.get('daemon'): parts.append(f"{soul_counts['daemon']} daemon")
+            soul_line += f"  ·  {', '.join(parts)}"
+        lbl(soul_line, pady=3)
+
+        if choir_count:
+            lbl(f"The Choir has convened {choir_count} time{'s' if choir_count > 1 else ''}.", italic=True, pady=1)
+
+        sep()
+
+        # ── Recent lore ───────────────────────────────────────────────────────
+        for line in summary.get('recent_lore', []):
+            lbl(line, color=t['fg_color'], italic=True, pady=2)
+
+        # ── Ghost tales (if any) ──────────────────────────────────────────────
+        ghost_tales = summary.get('ghost_tales', [])
+        if ghost_tales:
+            sep()
+            lbl("— from the ghost records —", italic=True, pady=1)
+            for tale in ghost_tales:
+                lbl(tale, color=t.get('accent_2', '#cc4444'), italic=True, pady=2)
+
+        # ── Regional legend (if any) ──────────────────────────────────────────
+        legend = summary.get('legend')
+        if legend:
+            sep()
+            lbl("— a local legend —", italic=True, pady=1)
+            lbl(legend, color=t.get('accent_4', '#888888'), italic=True, pady=2)
+
+        # ── Own identity ──────────────────────────────────────────────────────
+        own = self._world_identities.get(self.username)
+        if own:
+            sep()
+            soul = own.get('soul_type', 'mortal')
+            soul_label = {'seraph': '✦ Seraph', 'daemon': '⬡ Daemon', 'mortal': '· Mortal'}.get(soul, soul)
+            lbl(soul_label, color=t.get('accent_1', '#00ff88'), bold=True, pady=1)
+            lbl(own.get('title', ''), color=t.get('accent_1', '#00ff88'), bold=True, pady=1)
+            lbl(own.get('origin', ''), pady=1)
+            if own.get('faction'):
+                lbl(own['faction'], italic=True, pady=1)
+            if own.get('trait'):
+                lbl(f'"{own["trait"]}"', italic=True, color=t['fg_color'], pady=2)
+
 
     def draw_background(self):
         t  = self.theme
@@ -2683,7 +3374,7 @@ class HavenClient:
                 self.server_assigned_color = msg['user_color']
                 self.name_color = msg['user_color']; self.save_config()
             self.display_system_message("✓ Connected to server", local_only=True)
-            play_sound('self_join', self.sounds_enabled)
+            play_sound('self_join', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
         elif msg['type'] == 'auth_failed':
             messagebox.showerror("Authentication Failed", "Incorrect password")
             self.root.after(0, self.on_close)
@@ -2704,7 +3395,7 @@ class HavenClient:
             else:
                 plaintext = msg.get('text', '')
             self.display_message(msg['user'], plaintext)
-            play_sound('msg_received', self.sounds_enabled)
+            play_sound('msg_received', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
         elif msg['type'] == 'chat_history':
             # Clear in-memory log before loading authoritative server history
             self._msg_log.clear()
@@ -2738,7 +3429,7 @@ class HavenClient:
                     if not text:
                         continue
 
-                if user == 'System':
+                if user in ('System', 'World'):
                     self.display_message(user, text, timestamp=timestamp,
                                          color=t['system_msg_color'], from_history=True)
                 else:
@@ -2760,11 +3451,11 @@ class HavenClient:
         elif msg['type'] == 'voice_start':
             self.set_user_voice_active(msg['user'], True)
             if msg['user'] == self.username:
-                play_sound('ptt_start', self.sounds_enabled)
+                play_sound('ptt_start', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
         elif msg['type'] == 'voice_stop':
             self.set_user_voice_active(msg['user'], False)
             if msg['user'] == self.username:
-                play_sound('ptt_stop', self.sounds_enabled)
+                play_sound('ptt_stop', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
         elif msg['type'] == 'username_changed':
             self.display_system_message(f"✓ Username changed to {msg['new_username']}", local_only=True)
             old_username = self.username; self.username = msg['new_username']
@@ -2774,6 +3465,25 @@ class HavenClient:
             if old_username in self.speaker_labels:
                 self.speaker_labels[old_username].destroy(); del self.speaker_labels[old_username]
             self.add_user_to_list(self.username, self.name_color)
+        elif msg['type'] == 'world_identity':
+            self._expansion_enabled = True
+            identity = msg.get('identity', {})
+            summary  = msg.get('summary', {})
+            username = self.username
+            if identity:
+                self._world_identities[username] = identity
+            if summary:
+                self._world_summary = summary
+            self.root.after(0, lambda: self.update_userlist_with_colors(self._online_users))
+            self.root.after(0, self._refresh_world_panel)
+
+        elif msg['type'] == 'world_update':
+            # Server pushed a fresh summary (silent event — no chat message)
+            summary = msg.get('summary', {})
+            if summary:
+                self._world_summary = summary
+            self.root.after(0, self._refresh_world_panel)
+
         elif msg['type'] == 'kicked':
             messagebox.showerror("Kicked", "You have been kicked from the server.")
             self.root.after(0, self.on_close)
@@ -2786,12 +3496,29 @@ class HavenClient:
     def receive_udp(self):
         while self.running:
             try:
-                data, addr = self.udp_sock.recvfrom(8192)
+                packet, addr = self.udp_sock.recvfrom(8192)
+
+                # Strip sender header: [len(1)] [username(N)] [encrypted audio]
+                sender = None
+                if len(packet) >= 1:
+                    name_len = packet[0]
+                    if len(packet) >= 1 + name_len:
+                        try:
+                            sender = packet[1:1 + name_len].decode('utf-8')
+                        except Exception:
+                            sender = None
+                        data = packet[1 + name_len:]
+                    else:
+                        data = packet  # old server — no header
+                else:
+                    data = packet
+
                 # Decrypt voice packet
                 if self.session_crypto and HAVEN_CRYPTO:
                     data = self.session_crypto.decrypt_voice(data)
                     if data is None:
                         continue  # Drop tampered/invalid packet silently
+
                 if self.stream_out is None:
                     try:
                         device_index = self.audio_settings.get('output_device_index', None)
@@ -2805,13 +3532,18 @@ class HavenClient:
                             except: continue
                     except Exception as e:
                         print(f"Failed to open output stream: {e}"); continue
-                volume = self.audio_settings.get('output_volume', 100) / 100
+
+                # Apply volumes: global output × per-user override
+                master = self.audio_settings.get('output_volume', 100) / 100
+                per_user = self.user_volumes.get(sender, 100) / 100 if sender else 1.0
+                volume = master * per_user
                 if volume != 1.0:
                     try:
                         import numpy as np
                         audio_data = np.frombuffer(data, dtype=np.int16)
-                        data = (audio_data * volume).astype(np.int16).tobytes()
+                        data = (audio_data * volume).clip(-32768, 32767).astype(np.int16).tobytes()
                     except ImportError: pass
+
                 self.stream_out.write(data)
             except OSError: break
             except Exception as e: print(f"Error in receive_udp: {e}"); break
@@ -2850,6 +3582,12 @@ class HavenClient:
             return '[message could not be displayed]' 
 
     def send_chat(self, event=None):
+        # Throttle: ignore key-repeat events (held Return key fires many times/sec)
+        import time as _time
+        now = _time.monotonic()
+        if now - self._last_send_time < 0.1:
+            return
+        self._last_send_time = now
         text = self.msg_entry.get().strip()
         if text and self.authenticated:
             try:
@@ -2861,7 +3599,7 @@ class HavenClient:
                 self.tcp_sock.send((json.dumps(msg) + '\n').encode('utf-8'))
                 self.msg_entry.delete(0, tk.END)
                 self.display_message(self.username, text, align='right')
-                play_sound('msg_sent', self.sounds_enabled)
+                play_sound('msg_sent', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
             except UnicodeEncodeError:
                 messagebox.showerror("Error", "Message contains unsupported characters")
             except Exception:
@@ -2932,7 +3670,9 @@ class HavenClient:
             self._chat_insert(tk.END, f'[{timestamp}] ', 'ts')
             self.chat_text.tag_config('ts', foreground=t['accent_4'], font=TS_FONT)
 
-            if user == 'System':
+            if user == 'World':
+                pass  # World lore is panel-only — silently drop from chat
+            elif user == 'System':
                 self._chat_insert(tk.END, f'System: ', 'sys_name')
                 self.chat_text.tag_config('sys_name', foreground=t['system_msg_color'],
                                           font=(t['chat_font'], t['chat_font_size'], 'bold'))
@@ -3233,9 +3973,9 @@ class HavenClient:
                 if ' has joined the chat' in text:
                     joining_user = text.replace(' has joined the chat', '').strip()
                     if joining_user != getattr(self, 'username', ''):
-                        play_sound('user_join', self.sounds_enabled)
+                        play_sound('user_join', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
                 elif ' has left the chat' in text:
-                    play_sound('user_leave', self.sounds_enabled)
+                    play_sound('user_leave', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
             if not is_admin:
                 return  # hide all system messages from non-admins (sounds already fired above)
 
@@ -3292,6 +4032,7 @@ class HavenClient:
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
         self.speaker_labels.clear()
+        self._sigil_canvases.clear()
         for user_data in users_with_colors:
             self.user_colors[user_data['username']] = user_data.get('color', self.theme['accent_2'])
         for user_data in users_with_colors:
@@ -3301,16 +4042,290 @@ class HavenClient:
             self.user_colors[self.username] = self.name_color
 
     def add_user_to_list(self, username, color):
-        t = self.theme
+        t        = self.theme
+        identity = self._world_identities.get(username)
+
         card = tk.Frame(self.user_list_frame, bg=t['userlist_card_bg'],
                         highlightthickness=1, highlightbackground=t['accent_4'])
         card.pack(fill=tk.X, pady=5)
-        label = tk.Label(card, text=f"● {username}", bg=t['userlist_card_bg'], fg=color,
-                         font=('Segoe UI', 10), anchor='w', padx=10, pady=8)
-        label.pack(fill=tk.X)
+
+        if identity and self._expansion_enabled:
+            # ── Expansion card: sigil + name + title ──────────────────────
+            inner = tk.Frame(card, bg=t['userlist_card_bg'])
+            inner.pack(fill=tk.X, padx=8, pady=6)
+
+            # Sigil — rendered from SVG as a PhotoImage via base64 PNG fallback
+            # We draw the sigil on a small canvas using tkinter geometry
+            sigil_canvas = tk.Canvas(inner, width=28, height=28,
+                                     bg=t['userlist_card_bg'], highlightthickness=0)
+            sigil_canvas.pack(side=tk.LEFT, padx=(0, 6))
+            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=28)
+            self._sigil_canvases[username] = (sigil_canvas, color)
+
+            right = tk.Frame(inner, bg=t['userlist_card_bg'])
+            right.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            label = tk.Label(right, text=username,
+                             bg=t['userlist_card_bg'], fg=color,
+                             font=('Segoe UI', 10), anchor='w')
+            label.pack(fill=tk.X)
+
+            title_text = identity.get('title', '')
+            if title_text:
+                tk.Label(right, text=title_text,
+                         bg=t['userlist_card_bg'], fg=t['accent_4'],
+                         font=('Segoe UI', 7), anchor='w').pack(fill=tk.X)
+
+            # Tooltip on hover
+            self._bind_world_tooltip(card, identity)
+            self._bind_world_tooltip(inner, identity)
+            self._bind_world_tooltip(label, identity)
+        else:
+            # ── Standard card ─────────────────────────────────────────────
+            label = tk.Label(card, text=f"● {username}",
+                             bg=t['userlist_card_bg'], fg=color,
+                             font=('Segoe UI', 10), anchor='w', padx=10, pady=8)
+            label.pack(fill=tk.X)
+
         self.speaker_labels[username] = label
         if username in self.active_speakers:
             self.set_user_voice_active(username, True)
+
+    def _draw_sigil_on_canvas(self, canvas, username, color, size=28, rotation_offset=0):
+        """Draw a deterministic sigil on a tk.Canvas using pure tkinter geometry."""
+        import hashlib, math
+        cx = size / 2
+        cy = size / 2
+        radius = size * 0.38
+
+        def _rng_local(seed):
+            import random
+            h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
+            return random.Random(h)
+
+        r = _rng_local(f'sigil:{username}')
+        shape_type = r.choice(['polygon', 'star', 'orbital', 'rune'])
+
+        sw = max(1, int(size * 0.045 * 10) / 10)  # stroke width
+
+        def pt(angle_deg, dist):
+            a = math.radians(angle_deg - 90 + rotation_offset)
+            return (cx + dist * math.cos(a), cy + dist * math.sin(a))
+
+        def flat(points):
+            return [coord for p in points for coord in p]
+
+        if shape_type == 'polygon':
+            sides    = r.randint(3, 7)
+            rotation = r.uniform(0, 360 / sides)
+            pts = [pt(rotation + i * 360 / sides, radius) for i in range(sides)]
+            canvas.create_polygon(flat(pts), outline=color, fill='', width=sw)
+            if r.random() > 0.4:
+                inner_r    = radius * r.uniform(0.35, 0.6)
+                inner_sides = r.choice([sides, 3, 4])
+                inner_rot  = r.uniform(0, 360)
+                ipts = [pt(inner_rot + i * 360 / inner_sides, inner_r) for i in range(inner_sides)]
+                canvas.create_polygon(flat(ipts), outline=color, fill='', width=max(1, sw-1))
+            if r.random() > 0.5:
+                dot_r = size * 0.05
+                canvas.create_oval(cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r,
+                                   fill=color, outline='')
+
+        elif shape_type == 'star':
+            points  = r.randint(4, 7)
+            outer_r = radius
+            inner_r = radius * r.uniform(0.35, 0.55)
+            rotation = r.uniform(0, 360 / points)
+            star_pts = []
+            for i in range(points * 2):
+                angle = rotation + i * 180 / points
+                dist  = outer_r if i % 2 == 0 else inner_r
+                star_pts.append(pt(angle, dist))
+            canvas.create_polygon(flat(star_pts), outline=color, fill='', width=sw)
+            if r.random() > 0.5:
+                dot_r = size * 0.07
+                canvas.create_oval(cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r,
+                                   fill=color, outline='')
+
+        elif shape_type == 'orbital':
+            num_rings = r.randint(2, 3)
+            for i in range(num_rings):
+                ring_r = radius * (0.4 + 0.6 * (i + 1) / num_rings) * 0.85
+                canvas.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+                                   outline=color, fill='', width=max(1, sw - i))
+            num_lines = r.randint(2, 4)
+            for _ in range(num_lines):
+                angle = r.uniform(0, math.pi)
+                x1 = cx + radius * math.cos(angle)
+                y1 = cy + radius * math.sin(angle)
+                x2 = cx - radius * math.cos(angle)
+                y2 = cy - radius * math.sin(angle)
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=max(1, sw - 1))
+
+        elif shape_type == 'rune':
+            num_points = r.randint(4, 7)
+            angles = sorted(r.uniform(0, 360) for _ in range(num_points))
+            dists  = [r.uniform(radius * 0.4, radius) for _ in range(num_points)]
+            rune_pts = [pt(a, d) for a, d in zip(angles, dists)]
+            for i in range(len(rune_pts) - 1):
+                x1, y1 = rune_pts[i]
+                x2, y2 = rune_pts[i + 1]
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=sw, capstyle='round')
+            if r.random() > 0.4:
+                x1, y1 = rune_pts[-1]
+                x2, y2 = rune_pts[0]
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=sw, capstyle='round')
+            dot_r = size * 0.05
+            canvas.create_oval(rune_pts[0][0] - dot_r, rune_pts[0][1] - dot_r,
+                               rune_pts[0][0] + dot_r, rune_pts[0][1] + dot_r,
+                               fill=color, outline='')
+
+    # ── Sigil animation helpers ────────────────────────────────────────────────
+
+    def _hex_to_rgb(self, color):
+        h = color.lstrip('#')
+        return int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
+
+    def _boost_color(self, color, factor):
+        import colorsys
+        try:
+            r_v, g_v, b_v = self._hex_to_rgb(color)
+            hh, ss, vv = colorsys.rgb_to_hsv(r_v, g_v, b_v)
+            vv2 = min(1.0, vv * factor); ss2 = min(1.0, ss * 1.1)
+            r2, g2, b2 = colorsys.hsv_to_rgb(hh, ss2, vv2)
+            return f'#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}'
+        except Exception:
+            return color
+
+    def _color_with_alpha(self, color, alpha):
+        """Blend color toward canvas bg for pseudo-transparency."""
+        try:
+            r_v, g_v, b_v = self._hex_to_rgb(color)
+            bg = self.theme.get('userlist_card_bg', '#0a0a1a')
+            br, bg2, bb = self._hex_to_rgb(bg)
+            r2 = r_v * alpha + br * (1 - alpha)
+            g2 = g_v * alpha + bg2 * (1 - alpha)
+            b2 = b_v * alpha + bb * (1 - alpha)
+            return f'#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}'
+        except Exception:
+            return color
+
+    def _glow_sigil(self, canvas, username, color, _phase=0):
+        """
+        Full sigil animation while user is speaking:
+          - Sigil rotates continuously
+          - Outward glowing rings emanate from center
+          - 16ms tick (~60fps feel)
+        """
+        import math
+        if not canvas.winfo_exists(): return
+        if username not in self.active_speakers:
+            # User stopped — play sparkle burst then restore static sigil
+            self._sparkle_sigil(canvas, username, color, _frames=0)
+            return
+
+        size   = 28
+        cx, cy = size / 2, size / 2
+        phase  = _phase  # unbounded, wraps naturally in trig
+
+        canvas.delete('all')
+
+        # ── Outward glow rings ────────────────────────────────────────────────
+        # Two rings, offset in phase, expanding outward and fading
+        for ring_offset in [0, 15]:
+            ring_phase = (phase + ring_offset) % 30
+            # Radius grows from 10 → 18 over 30 frames
+            r_min, r_max = 10, 18
+            ring_r  = r_min + (r_max - r_min) * (ring_phase / 30)
+            # Alpha fades from 0.5 → 0 as ring expands
+            ring_alpha = 0.5 * (1.0 - ring_phase / 30)
+            ring_color = self._color_with_alpha(color, ring_alpha)
+            # Draw as thick oval outline
+            thickness = max(1, int(3 * (1.0 - ring_phase / 30)))
+            canvas.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+                               outline=ring_color, width=thickness)
+
+        # ── Rotating sigil ────────────────────────────────────────────────────
+        # Boost color slightly while speaking
+        speak_color = self._boost_color(color, 1.3)
+        rotation_deg = (phase * 3) % 360  # 3 deg/frame = ~1 full rotation/2 sec
+        self._draw_sigil_on_canvas(canvas, username, speak_color, size=size,
+                                   rotation_offset=rotation_deg)
+
+        canvas.after(16, lambda: self._glow_sigil(canvas, username, color, _phase + 1))
+
+    def _sparkle_sigil(self, canvas, username, color, _frames=0):
+        """
+        Post-voice sparkle burst: 8 dots fly outward from center and fade over ~500ms.
+        """
+        import math
+        if not canvas.winfo_exists(): return
+        if username in self.active_speakers: return  # started speaking again
+
+        TOTAL_FRAMES = 20
+        size = 28; cx = size / 2; cy = size / 2
+
+        canvas.delete('all')
+
+        if _frames < TOTAL_FRAMES:
+            progress = _frames / TOTAL_FRAMES  # 0 → 1
+            # Restore base sigil underneath
+            self._draw_sigil_on_canvas(canvas, username, color, size=size)
+            # 8 spark dots flying outward
+            n_sparks = 8
+            for i in range(n_sparks):
+                angle = math.radians(i * 360 / n_sparks)
+                dist  = 4 + 10 * progress   # 4 → 14 px from center
+                sx    = cx + dist * math.cos(angle)
+                sy    = cy + dist * math.sin(angle)
+                alpha = 1.0 - progress       # fade out
+                spark_color = self._color_with_alpha(color, alpha)
+                dot_r = max(1.0, 2.5 * (1.0 - progress))
+                canvas.create_oval(sx - dot_r, sy - dot_r, sx + dot_r, sy + dot_r,
+                                   fill=spark_color, outline='')
+            canvas.after(25, lambda: self._sparkle_sigil(canvas, username, color, _frames + 1))
+        else:
+            # Sparkle done — restore clean static sigil
+            self._draw_sigil_on_canvas(canvas, username, color, size=size)
+
+    def _bind_world_tooltip(self, widget, identity):
+        """Bind hover tooltip showing world title + origin + trait."""
+        tip_win = [None]
+
+        def show(e):
+            if tip_win[0]:
+                return
+            t = self.theme
+            title   = identity.get('title', '')
+            origin  = identity.get('origin', '')
+            trait   = identity.get('trait', '')
+            faction = identity.get('faction', '')
+            text    = f"{title}\n{origin}"
+            if faction: text += f"\n{faction}"
+            text   += f'\n\n"{trait}"'
+
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes('-topmost', True)
+            win.configure(bg=t['glass_accent'])
+            lbl = tk.Label(win, text=text, bg=t['glass_accent'],
+                           fg=t['fg_color'], font=('Segoe UI', 8),
+                           padx=10, pady=8, justify='left',
+                           wraplength=180)
+            lbl.pack()
+            # Position near cursor
+            x = e.x_root + 12
+            y = e.y_root + 8
+            win.geometry(f'+{x}+{y}')
+            tip_win[0] = win
+
+        def hide(e):
+            if tip_win[0]:
+                tip_win[0].destroy()
+                tip_win[0] = None
+
+        widget.bind('<Enter>', show)
+        widget.bind('<Leave>', hide)
 
     def update_user_color(self, username, new_color):
         self.user_colors[username] = new_color
@@ -3324,14 +4339,32 @@ class HavenClient:
     def set_user_voice_active(self, username, active):
         if active: self.active_speakers.add(username)
         else:      self.active_speakers.discard(username)
+        user_color = self.user_colors.get(username, self.theme['fg_color'])
+
+        # Glow/unglow sigil canvas if expansion worlds on
+        if username in self._sigil_canvases and self._expansion_enabled:
+            canvas, base_color = self._sigil_canvases[username]
+            if canvas.winfo_exists():
+                if active:
+                    self._glow_sigil(canvas, username, user_color)
+                else:
+                    # _glow_sigil checks active_speakers and triggers sparkle itself
+                    # but if it wasn't running (e.g. rejoined), trigger sparkle directly
+                    self._sparkle_sigil(canvas, username, user_color, _frames=0)
+
         if username in self.speaker_labels:
-            label      = self.speaker_labels[username]
-            user_color = self.user_colors.get(username, self.theme['fg_color'])
+            label = self.speaker_labels[username]
             if active:
-                label.config(fg=user_color, font=('Segoe UI', 10, 'bold'), text=f"🔴 {username}")
+                if not self._expansion_enabled:
+                    label.config(fg=user_color, font=('Segoe UI', 10, 'bold'), text=f"🔴 {username}")
+                else:
+                    label.config(fg=user_color, font=('Segoe UI', 10, 'bold'))
                 self.pulse_speaker(label, username)
             else:
-                label.config(fg=user_color, font=('Segoe UI', 10), text=f"● {username}")
+                if not self._expansion_enabled:
+                    label.config(fg=user_color, font=('Segoe UI', 10), text=f"● {username}")
+                else:
+                    label.config(fg=user_color, font=('Segoe UI', 10))
 
     def pulse_speaker(self, label, username):
         if username in self.active_speakers and label.winfo_exists():
@@ -3353,7 +4386,6 @@ class HavenClient:
         btn = self.settings_btn
 
         # Menu items: (label, command) — None = separator
-        sounds_label = f"Sounds: {'On' if self.sounds_enabled else 'Off'}"
         items = [
             ("Change Username",        self.change_username),
             ("Change Name Color",      self.change_name_color),
@@ -3361,9 +4393,10 @@ class HavenClient:
             ("Audio Devices & Volume", self.configure_audio_devices),
             ("Change Theme",           self.change_theme),
             None,
-            (sounds_label,             self._toggle_sounds),
+            ("Sound Settings",          self.open_sound_settings),
             None,
             ("Clear Saved Password",   self.clear_saved_password),
+            ("Change Server",          self.change_server),
             None,
             ("About",                  self.show_about),
         ]
@@ -3448,11 +4481,22 @@ class HavenClient:
         if dialog.result and dialog.result != self.theme_name:
             self.apply_theme(dialog.result)
 
-    def _toggle_sounds(self):
-        self.sounds_enabled = not self.sounds_enabled
+    def open_sound_settings(self):
+        known_users = [u for u in self.user_colors if u != self.username]
+        dialog = SoundSettingsDialog(
+            self.root, self.theme,
+            self.sounds_enabled, self.sfx_volume, self.user_volumes,
+            known_users,
+            on_save=self._apply_sound_settings
+        )
+        self.root.wait_window(dialog)
+
+    def _apply_sound_settings(self, enabled, sfx_vol, user_vols):
+        self.sounds_enabled = enabled
+        self.sfx_volume     = sfx_vol
+        self.user_volumes.update(user_vols)
+        _sfx_volume_ref[0]  = sfx_vol
         self.save_config()
-        state = 'On' if self.sounds_enabled else 'Off'
-        self.display_system_message(f"🔊 Sounds turned {state}", local_only=True)
 
     def change_username(self):
         dialog = ModernInputDialog(self.root, "Change Username", "Enter new username:", theme=self.theme, app=self)
@@ -3549,6 +4593,29 @@ class HavenClient:
     def clear_saved_password(self):
         self.saved_wire_hash = None; self.save_config()
         messagebox.showinfo("Password Cleared", "Saved password has been cleared.")
+
+    def change_server(self):
+        """Clear saved password and server, disconnect, and restart to login screen."""
+        if not messagebox.askyesno("Change Server",
+                                   "This will clear your saved password and return you to the login screen.\n\nContinue?"):
+            return
+        # Wipe saved credentials and server
+        self.saved_wire_hash = None
+        cfg = self.load_config() or {}
+        cfg.pop('server_ip', None)
+        cfg['password'] = ''
+        cfg['remember'] = False
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+        # Restart the app — login dialog will appear fresh
+        import subprocess
+        try: self.root.after(100, self.root.destroy)
+        except: pass
+        self.running = False
+        subprocess.Popen(get_exe_path())
 
     # ── Voice ────────────────────────────────────────────────────
 
