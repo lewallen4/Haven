@@ -22,6 +22,12 @@ if _bin_dir not in sys.path:
     sys.path.insert(0, _os.path.abspath(_bin_dir))
 
 try:
+    from haven_world import WorldState, generate_identity, generate_sigil_svg
+    HAVEN_WORLD = True
+except ImportError:
+    HAVEN_WORLD = False
+
+try:
     from haven_crypto import (
         generate_kyber_keypair, kyber_encapsulate, kyber_decapsulate,
         generate_x25519_keypair, x25519_exchange,
@@ -66,6 +72,10 @@ UDP_RATE_LIMIT         = 80
 UDP_RATE_WINDOW        = 1.0
 
 BANNED_IPS = set()
+
+# Expansion Worlds — off by default, toggled via server_config.json or /expansion
+EXPANSION_ENABLED = False
+_world_state: 'WorldState | None' = None
 # -----------------------------------
 
 USER_COLOR_PALETTE = [
@@ -135,7 +145,7 @@ def create_ssl_context():
 # ---------- Config / Password ----------
 
 def load_or_create_config():
-    global SERVER_PASSWORD_HASH
+    global SERVER_PASSWORD_HASH, EXPANSION_ENABLED
 
     if os.path.exists(SERVER_CONFIG_FILE):
         try:
@@ -151,6 +161,7 @@ def load_or_create_config():
                 algo = 'Argon2id' if stored.startswith('argon2:') else ('PBKDF2' if stored.startswith('pbkdf2:') else 'SHA-256 (legacy)')
                 if wire:
                     _SERVER_AUTH_CACHE['wire_response'] = wire
+                EXPANSION_ENABLED = config.get('expansion_worlds', False)
                 return
         except Exception as e:
             print(f"  ⚠ Could not read config: {e}")
@@ -183,7 +194,7 @@ def _upgrade_config_hash(new_hash):
 
 def save_config():
     try:
-        data = {'password_hash': SERVER_PASSWORD_HASH}
+        data = {'password_hash': SERVER_PASSWORD_HASH, 'expansion_worlds': EXPANSION_ENABLED}
         wire = _SERVER_AUTH_CACHE.get('wire_response', '')
         if wire:
             data['password_wire_hash'] = wire
@@ -644,6 +655,46 @@ def handle_tcp_client(conn, addr):
                         _auth_failures.pop(ip, None)
                         _auth_lockouts.pop(ip, None)
 
+                    # Expansion Worlds — generate identity (lore: world panel only, silent)
+                    world_identity = None
+                    if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
+                        try:
+                            with clients_lock:
+                                online_now   = [u for u, i in clients.items()
+                                                if i.get('authenticated') and u != username]
+                                online_count = len(online_now) + 1
+
+                            world_identity, _arrival_lore, _bond_lore, _prophecy_lore = \
+                                _world_state.register_user(username, online_users=online_now)
+
+                            # Choir (5+ users) or gathering (3-4) — silent, world panel only
+                            recent_types = [e.get('type') for e in _world_state.events[-4:]]
+                            if online_count >= 5 and 'choir' not in recent_types:
+                                _world_state.record_choir(online_count)
+                            elif online_count >= 3 and 'gathering' not in recent_types and 'choir' not in recent_types:
+                                _world_state.record_gathering(online_count)
+
+                        except Exception as e:
+                            log_action(f'World identity error for {username}: {e}')
+                            world_identity = None
+
+                    if world_identity:
+                        send_json(conn, {
+                            'type':     'world_identity',
+                            'identity': world_identity,
+                            'summary':  _world_state.get_world_summary(),
+                        })
+                        # Push fresh summary to all other users (silent — world panel refresh only)
+                        world_summary = _world_state.get_world_summary()
+                        with clients_lock:
+                            for other_conn in [i['tcp'] for u, i in clients.items()
+                                               if i.get('authenticated') and u != username]:
+                                try:
+                                    send_json(other_conn, {'type': 'world_update',
+                                                           'summary': world_summary})
+                                except Exception:
+                                    pass
+
                     # History sent encrypted — session is passed in
                     send_chat_history(conn, session)
 
@@ -776,6 +827,23 @@ def handle_tcp_client(conn, addr):
             leave_text = f'{username} has left the chat'
             broadcast_encrypted_chat('System', leave_text)
             add_to_history('System', leave_text)
+            # Expansion Worlds — record departure (silent: world panel only)
+            if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
+                try:
+                    _world_state.record_departure(username)
+                    with clients_lock:
+                        online_count  = sum(1 for i in clients.values() if i.get('authenticated'))
+                        other_conns   = [i['tcp'] for i in clients.values() if i.get('authenticated')]
+                    if online_count == 0:
+                        _world_state.record_silence()
+                    world_summary = _world_state.get_world_summary()
+                    for other_conn in other_conns:
+                        try:
+                            send_json(other_conn, {'type': 'world_update', 'summary': world_summary})
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log_action(f'World departure error: {e}')
         conn.close()
 
 # ---------- Server Heartbeat --------------------------------------------------
@@ -818,6 +886,17 @@ def server_heartbeat():
             add_to_history('System', leave_text)
 
 # ---------- TCP Server --------------------------------------------------------
+
+def _init_world():
+    """Initialise the world state if expansion is enabled."""
+    global _world_state
+    if EXPANSION_ENABLED and HAVEN_WORLD:
+        world_file = os.path.join(_SERVER_DIR, 'world.json')
+        _world_state = WorldState(world_file)
+        _world_state.load()
+        log_action(f'Expansion Worlds enabled — {len(_world_state.users)} souls in the record')
+    else:
+        _world_state = None
 
 def tcp_server():
     ssl_ctx = create_ssl_context()
@@ -888,12 +967,17 @@ def udp_server():
                 if pcm is None:
                     continue
 
+                # Encode sender username as a 1-byte length prefix so the
+                # client can apply per-user volume: [len(1)] [username(N)] [audio]
+                sender_bytes = sender.encode('utf-8')[:255]
+                header = bytes([len(sender_bytes)]) + sender_bytes
+
                 for uname, info in recipients:
                     recv_session = info.get('session')
                     if recv_session:
                         enc = recv_session.encrypt_voice(pcm)
                         try:
-                            udp_sock.sendto(enc, (info['addr'][0], info['udp_port']))
+                            udp_sock.sendto(header + enc, (info['addr'][0], info['udp_port']))
                         except: pass
             else:
                 pass
@@ -930,7 +1014,7 @@ def _setup_wire_auth():
 
 # ---------- Admin Console -----------------------------------------------------
 
-def admin_console():
+def _print_admin_banner():
     print("\n" + "="*60)
     print("  HAVEN CHAT SERVER - ADMIN CONSOLE")
     print("="*60)
@@ -942,10 +1026,12 @@ def admin_console():
     print("  /history [n]         - Show last n messages")
     print("  /stats               - Connection stats")
     print("  /crypto              - Show crypto status")
+    print("  /expansion [on|off]  - Toggle Expansion Worlds")
     print("  /save                - Save chat history")
     print("  /help                - This help")
-    print("="*60 + "\n")
+    print("="*60)
 
+def admin_console():
     while True:
         try:
             cmd = input().strip()
@@ -1067,8 +1153,33 @@ def admin_console():
         elif cmd == '/save':
             save_chat_history(); print('  ✓ Saved')
 
+        elif cmd.startswith('/expansion'):
+            global EXPANSION_ENABLED, _world_state
+            parts = cmd.split()
+            if len(parts) < 2:
+                status = 'on' if EXPANSION_ENABLED else 'off'
+                souls  = len(_world_state.users) if _world_state else 0
+                print(f'  Expansion Worlds: {status} | {souls} souls in record')
+            elif parts[1] == 'on':
+                if not HAVEN_WORLD:
+                    print('  ✗ haven_world.py not found in bin/')
+                else:
+                    EXPANSION_ENABLED = True
+                    _init_world()
+                    save_config()
+                    log_action('Expansion Worlds enabled')
+                    print('  ✓ Expansion Worlds enabled')
+            elif parts[1] == 'off':
+                EXPANSION_ENABLED = False
+                _world_state = None
+                save_config()
+                log_action('Expansion Worlds disabled')
+                print('  ✓ Expansion Worlds disabled')
+            else:
+                print('  Usage: /expansion [on|off]')
+
         elif cmd == '/help':
-            print("  /kick /ban /unban /password /list /history /stats /crypto /save /help")
+            print("  /kick /ban /unban /password /list /history /stats /crypto /expansion /save /help")
 
         else:
             if cmd: print('  ✗ Unknown command. /help for help.')
@@ -1091,13 +1202,23 @@ if __name__ == '__main__':
 
     print_network_info()
     load_chat_history()
+    _init_world()
 
-    threading.Thread(target=tcp_server,        daemon=True).start()
-    threading.Thread(target=udp_server,        daemon=True).start()
-    threading.Thread(target=admin_console,     daemon=True).start()
-    threading.Thread(target=server_heartbeat,  daemon=True).start()
+    # All setup done — now start threads then print the banner so [LOG] lines
+    # from load_chat_history / _init_world don't interleave with the banner.
+    threading.Thread(target=tcp_server,       daemon=True).start()
+    threading.Thread(target=udp_server,       daemon=True).start()
+    threading.Thread(target=server_heartbeat, daemon=True).start()
 
-    print("  Server running. Type /help for admin commands.")
-    print()
-    while True:
-        time.sleep(1)
+    # Print banner synchronously here before handing stdin to admin_console
+    _print_admin_banner()
+    if EXPANSION_ENABLED:
+        souls = len(_world_state.users) if _world_state else 0
+        print(f"  Expansion Worlds : enabled  ({souls} souls in record)")
+    else:
+        print(f"  Expansion Worlds : off")
+    print(f"  Status           : running — /help for commands")
+    print("=" * 60 + "\n")
+
+    # admin_console takes over stdin on the main thread
+    admin_console()
