@@ -370,12 +370,15 @@ class HavenSession:
             elif msg.get('text'):
                 text = msg['text']
             elif msg.get('ct') and self.session:
-                # ct present but encrypted flag missing
                 try:   text = self.session.decrypt_chat(msg['ct'])
                 except: text = f'{ERR_C}[decryption failed]{RESET}'
             else:
                 text = f'{DIM_C}[encrypted — no session]{RESET}'
             if text is not None:
+                # Mirror main client: hide System messages from non-admins
+                if user == 'System':
+                    if not (self.username or '').startswith('admin_'):
+                        return
                 print_msg(user, text, ts, clr)
 
         elif t == 'chat_history':
@@ -385,13 +388,18 @@ class HavenSession:
                 print_sys(f'── last {len(hist)} messages ──', DIM_C)
                 for h in hist:
                     # History is stored as plaintext on the server (pre-session)
+                    huser = h.get('user','?')
+                    # Hide System messages from non-admins (match main client)
+                    if huser == 'System':
+                        if not (self.username or '').startswith('admin_'):
+                            continue
                     text = h.get('text', '')
                     if not text and h.get('ct') and self.session:
                         try:    text = self.session.decrypt_chat(h['ct'])
                         except: text = '[encrypted]'
                     if not text:
                         text = '[encrypted]'
-                    print_msg(h.get('user','?'), text, h.get('timestamp'), h.get('color', h.get('user_color')))
+                    print_msg(huser, text, h.get('timestamp'), h.get('color', h.get('user_color')))
                 print_sep()
 
         elif t == 'userlist_full':
