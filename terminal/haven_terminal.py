@@ -179,6 +179,7 @@ def print_sep(char='─', color=DIM_C):
         print(f'{color}{char * term_width()}{RESET}')
 
 def draw_sigil_ascii(username, color_hex='#3ecfcf', width=21, height=11):
+    import math, hashlib, random
     """Render a deterministic sigil as ASCII art — same algorithm as the desktop client."""
     def _rgb(h):
         h = h.lstrip('#')
