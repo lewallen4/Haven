@@ -1774,7 +1774,7 @@ class AboutDialog(tk.Toplevel):
 
         tk.Label(self, text="HAVEN", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 20, 'bold')).pack(pady=(20, 4))
-        tk.Label(self, text="v3.5", bg=self.t['glass_bg'], fg=self.t['accent_4'],
+        tk.Label(self, text="v3.2", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 11)).pack()
         tk.Label(self, text=f"Current theme: {theme.get('name', theme_name)}",
                  bg=self.t['glass_bg'], fg=self.t['fg_color'],
