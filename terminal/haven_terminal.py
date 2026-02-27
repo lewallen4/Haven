@@ -190,9 +190,11 @@ def draw_sigil_ascii(username, color_hex='#3ecfcf', width=21, height=11):
     rx, ry = width*0.38, height*0.38
 
     def _rng(seed):
+        import random as _random
         h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
-        return random.Random(h)
+        return _random.Random(h)
 
+    import random
     r = _rng(f'sigil:{username}')
     shape_type = r.choice(['polygon','star','orbital','rune'])
 
@@ -547,7 +549,7 @@ class HavenSession:
                 if ident.get('trait'):    print(f'  {LORE_C}{ITALIC}"{ident["trait"]}"{RESET}')
             else:
                 # Still show shape type as flavour even without world data
-                rng = random.Random(int(hashlib.sha256(f'sigil:{target}'.encode()).hexdigest(),16))
+                import random as _r2; rng = _r2.Random(int(hashlib.sha256(f'sigil:{target}'.encode()).hexdigest(),16))
                 shape = rng.choice(['polygon','star','orbital','rune'])
                 print(f'  {DIM_C}sigil type: {shape}{RESET}')
             print_sep('─')
