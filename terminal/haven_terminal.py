@@ -293,6 +293,7 @@ class HavenSession:
         self.color       = None
         self.users       = {}     # name → color
         self.world       = {}
+        self._user_identities = {}  # username → identity dict
         self.running     = False
         self._buf        = ''
         self._recv_thread= None
@@ -506,16 +507,28 @@ class HavenSession:
                 print_sys(f'{color_name(u, clr)} {SYS_C}left', SYS_C)
 
         elif t == 'world_update':
-            # summary is nested under 'summary' key
-            self.world = msg.get('summary', msg)
+            summary = msg.get('summary', msg)
+            if summary:
+                self.world = summary
+                # Index all_users by username for fast profile lookup
+                self._user_identities = {
+                    u['username']: u for u in summary.get('all_users', [])
+                    if 'username' in u
+                }
 
         elif t == 'world_identity':
             summary = msg.get('summary', {})
             if summary:
                 self.world = summary
+                self._user_identities = {
+                    u['username']: u for u in summary.get('all_users', [])
+                    if 'username' in u
+                }
             identity = msg.get('identity', {})
             if identity:
                 self.world['own_identity'] = identity
+                if self.username:
+                    self._user_identities[self.username] = identity
 
         elif t in ('voice_start', 'voice_stop'):
             pass  # no voice in terminal client
@@ -534,25 +547,24 @@ class HavenSession:
             print()
             # Name + color
             print(f'  {color_name(target, clr)}')
-            # World identity if we have it
+            # World identity — check own_identity first, then all_users index
             ident = None
-            if self.world:
-                if target == self.username:
-                    ident = self.world.get('own_identity')
-                else:
-                    ident = self.world.get('identities', {}).get(target)
+            if target == self.username:
+                ident = self.world.get('own_identity') if self.world else None
+            if not ident:
+                ident = self._user_identities.get(target)
             if ident:
-                soul = ident.get('soul_type','mortal')
-                icon = {'seraph':'✦','daemon':'⬡','mortal':'·'}.get(soul,'·')
-                print(f'  {ACCENT}{icon} {ident.get("title","")}{RESET}')
-                if ident.get('origin'):   print(f'  {DIM_C}{ident["origin"]}{RESET}')
-                if ident.get('faction'):  print(f'  {DIM_C}{ident["faction"]}{RESET}')
-                if ident.get('trait'):    print(f'  {LORE_C}{ITALIC}"{ident["trait"]}"{RESET}')
+                soul = ident.get('soul_type', 'mortal')
+                icon = {'seraph': '✦', 'daemon': '⬡', 'mortal': '·'}.get(soul, '·')
+                print(f'  {ACCENT}{icon} {ident.get("title", "")}{RESET}')
+                if ident.get('origin'):  print(f'  {DIM_C}{ident["origin"]}{RESET}')
+                if ident.get('faction'): print(f'  {DIM_C}{ident["faction"]}{RESET}')
+                if ident.get('trait'):   print(f'  {LORE_C}{ITALIC}"{ident["trait"]}"{RESET}')
             else:
-                # Still show shape type as flavour even without world data
-                import random as _r2; rng = _r2.Random(int(hashlib.sha256(f'sigil:{target}'.encode()).hexdigest(),16))
-                shape = rng.choice(['polygon','star','orbital','rune'])
-                print(f'  {DIM_C}sigil type: {shape}{RESET}')
+                import random as _r2, hashlib as _hl
+                rng = _r2.Random(int(_hl.sha256(f'sigil:{target}'.encode()).hexdigest(), 16))
+                shape = rng.choice(['polygon', 'star', 'orbital', 'rune'])
+                print(f'  {DIM_C}sigil type: {shape}  (no world data yet){RESET}')
             print_sep('─')
         else:
             if not self.users:
