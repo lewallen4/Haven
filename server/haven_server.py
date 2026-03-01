@@ -99,8 +99,13 @@ active_speakers_lock = threading.Lock()   # FIX: was unprotected
 chat_history    = deque(maxlen=MAX_HISTORY_MESSAGES)
 history_lock    = threading.Lock()
 
-udp_rate_tracker = defaultdict(deque)
-udp_rate_lock    = threading.Lock()
+udp_rate_tracker     = defaultdict(deque)
+udp_rate_lock        = threading.Lock()
+
+TCP_CHAT_RATE_LIMIT  = 10           # max messages per window
+TCP_CHAT_RATE_WINDOW = 3.0          # seconds
+_tcp_chat_rate       = defaultdict(deque)
+_tcp_chat_rate_lock  = threading.Lock()
 
 _AUTH_FAIL_WINDOW   = 600
 _AUTH_FAIL_MAX      = 5
@@ -111,6 +116,8 @@ _auth_lock          = threading.Lock()
 
 voice_sessions      = {}
 voice_sessions_lock = threading.Lock()
+
+_world_state_lock   = threading.Lock()
 
 SERVER_PASSWORD_HASH = ''
 
@@ -162,6 +169,7 @@ def load_or_create_config():
                 if wire:
                     _SERVER_AUTH_CACHE['wire_response'] = wire
                 EXPANSION_ENABLED = config.get('expansion_worlds', False)
+                BANNED_IPS.update(config.get('banned_ips', []))
                 return
         except Exception as e:
             print(f"  ⚠ Could not read config: {e}")
@@ -194,7 +202,8 @@ def _upgrade_config_hash(new_hash):
 
 def save_config():
     try:
-        data = {'password_hash': SERVER_PASSWORD_HASH, 'expansion_worlds': EXPANSION_ENABLED}
+        data = {'password_hash': SERVER_PASSWORD_HASH, 'expansion_worlds': EXPANSION_ENABLED,
+                'banned_ips': list(BANNED_IPS)}
         wire = _SERVER_AUTH_CACHE.get('wire_response', '')
         if wire:
             data['password_wire_hash'] = wire
@@ -253,22 +262,14 @@ def _history_key():
     return _hmac.new(wire.encode(), b'history-encryption-key-v1', hashlib.sha256).digest()
 
 # ---------- History Encryption (AES-256-GCM direct, no haven_crypto API) ------
-# We use the cryptography library directly rather than encrypt_message() to
-# avoid any ambiguity about that function's key format or return type.
 
 def _encrypt_history(data_bytes: bytes, key: bytes) -> bytes:
-    """
-    AES-256-GCM encrypt with a random 12-byte nonce.
-    Layout: 0x02 | nonce(12) | ciphertext+tag(len+16)
-    Falls back to SHAKE256-CTR+HMAC if cryptography lib unavailable.
-    """
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         nonce = os.urandom(12)
         ct = AESGCM(key[:32]).encrypt(nonce, data_bytes, None)
         return b'\x02' + nonce + ct
     except ImportError:
-        # SHAKE256-CTR + HMAC-SHA256 stdlib fallback
         nonce = os.urandom(12)
         h = hashlib.shake_256()
         h.update(key + nonce + b'history-ctr')
@@ -279,14 +280,10 @@ def _encrypt_history(data_bytes: bytes, key: bytes) -> bytes:
         return b'\x01' + nonce + tag + ct
 
 def _decrypt_history(enc_bytes: bytes, key: bytes):
-    """Returns decrypted bytes or None on auth/format failure."""
     if not enc_bytes:
         return None
-
     version = enc_bytes[0]
-
     if version == 0x02:
-        # AES-256-GCM direct
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             nonce = enc_bytes[1:13]
@@ -294,9 +291,7 @@ def _decrypt_history(enc_bytes: bytes, key: bytes):
             return AESGCM(key[:32]).decrypt(nonce, ct, None)
         except Exception:
             return None
-
     elif version == 0x01:
-        # Legacy SHAKE256-CTR — reads fine, re-saves as 0x02 on next write
         payload = enc_bytes[1:]
         if len(payload) < 44:
             return None
@@ -311,9 +306,7 @@ def _decrypt_history(enc_bytes: bytes, key: bytes):
         h.update(key + nonce + b'history-ctr')
         ks = h.digest(len(ct))
         return bytes(a ^ b for a, b in zip(ct, ks))
-
     else:
-        # Pre-versioned legacy format — try SHAKE256-CTR without version byte
         payload = enc_bytes
         if len(payload) < 44:
             return None
@@ -334,9 +327,7 @@ def load_chat_history():
     try:
         with open(CHAT_HISTORY_FILE, 'r') as f:
             wrapper = json.load(f)
-
         if isinstance(wrapper, list):
-            # Legacy plaintext format — migrate to encrypted on next save
             data = wrapper
             log_action(f'Loaded {len(data)} messages (plaintext — will encrypt on next save)')
         elif wrapper.get('v') == 1:
@@ -353,7 +344,6 @@ def load_chat_history():
         else:
             log_action('Unknown history format — skipping')
             return
-
         with history_lock:
             chat_history.extend(data)
     except FileNotFoundError:
@@ -378,6 +368,44 @@ def save_chat_history():
     except Exception as e:
         log_action(f'Error saving chat history: {e}')
 
+def _archive_chat_page(messages):
+    """Encrypt and save a page of old messages to logs/chat_TIMESTAMP.json."""
+    try:
+        _ensure_logs_dir()
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        path  = os.path.join(LOGS_DIR, f'chat_{stamp}.json')
+        payload = json.dumps(messages).encode('utf-8')
+        key = _history_key()
+        if key:
+            enc     = _encrypt_history(payload, key)
+            wrapper = {'v': 1, 'data': base64.b64encode(enc).decode('ascii')}
+        else:
+            wrapper = messages
+        with open(path, 'w') as f:
+            json.dump(wrapper, f)
+    except Exception as e:
+        log_action(f'Chat archive error: {e}')
+
+def _load_chat_archive(path):
+    """Decrypt and return messages from an archive file, or [] on failure."""
+    try:
+        with open(path, 'r') as f:
+            wrapper = json.load(f)
+        if isinstance(wrapper, list):
+            return wrapper
+        if wrapper.get('v') == 1:
+            key = _history_key()
+            if key is None:
+                return []
+            enc_bytes = base64.b64decode(wrapper['data'])
+            pt = _decrypt_history(enc_bytes, key)
+            if pt is None:
+                return []
+            return json.loads(pt.decode('utf-8'))
+    except Exception:
+        pass
+    return []
+
 def add_to_history(user, text):
     ts = datetime.datetime.now().strftime('%H:%M')
     user_color = None
@@ -385,12 +413,35 @@ def add_to_history(user, text):
         if user in clients and user != 'System':
             user_color = clients[user].get('color')
     with history_lock:
+        # Explicitly pop and archive oldest PAGE_SIZE messages when full,
+        # before appending — prevents deque auto-eviction from losing messages
+        if len(chat_history) == chat_history.maxlen:
+            page = [chat_history.popleft() for _ in range(CHAT_PAGE_SIZE)]
+            threading.Thread(target=_archive_chat_page, args=(page,), daemon=True).start()
         chat_history.append({'user': user, 'text': text, 'timestamp': ts, 'color': user_color})
     threading.Thread(target=save_chat_history, daemon=True).start()
+
+LOG_MAX_BYTES    = 50 * 1024 * 1024  # 50 MB per log file before rotation
+LOGS_DIR         = os.path.join(_SERVER_DIR, 'logs')
+CHAT_PAGE_SIZE   = 200   # messages per archive page
+
+def _ensure_logs_dir():
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 def log_action(action):
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     safe_action = action.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= LOG_MAX_BYTES:
+            _ensure_logs_dir()
+            stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            archive = os.path.join(LOGS_DIR, f'server_{stamp}.log')
+            os.replace(LOG_FILE, archive)
+    except Exception:
+        pass
     with open(LOG_FILE, 'a', encoding='utf-8', errors='replace') as f:
         f.write(f'[{ts}] {safe_action}\n')
     console_enc = sys.stdout.encoding or 'utf-8'
@@ -413,22 +464,15 @@ def broadcast_tcp(message, exclude=None):
 def broadcast_full_userlist():
     with clients_lock:
         user_list = [
-            {'username': u, 'color': i.get('color', generate_random_color())}
+            {'username': u, 'color': i.get('color', generate_random_color()),
+             'has_voice': bool(i.get('udp_port', 0))}
             for u, i in clients.items() if i.get('authenticated')
         ]
     broadcast_tcp({'type': 'userlist_full', 'users': user_list})
 
-# ---------- FIX: History sent encrypted per-recipient -------------------------
+# ---------- History sent encrypted per-recipient -------------------------
 
 def send_chat_history(conn, session):
-    """
-    Send chat history encrypted with the recipient's session key.
-    Each message is individually encrypted so the wire format matches live
-    broadcast messages — no plaintext history ever leaves the server.
-
-    If session is None (shouldn't happen — server rejects clients without one)
-    we do NOT send history at all rather than leaking it in plaintext.
-    """
     if session is None:
         log_action('Skipping history send — no session (would be plaintext)')
         return
@@ -437,7 +481,6 @@ def send_chat_history(conn, session):
             history_data = list(chat_history)
         if not history_data:
             return
-
         encrypted_history = []
         for entry in history_data:
             plaintext = entry.get('text', '')
@@ -451,10 +494,8 @@ def send_chat_history(conn, session):
                     'ct':        ct,
                 })
             except Exception as e:
-                # Skip messages that fail to encrypt rather than sending plaintext
                 log_action(f'History entry encryption failed, skipping: {e}')
                 continue
-
         if encrypted_history:
             send_json(conn, {'type': 'chat_history', 'history': encrypted_history})
             log_action(f'Sent {len(encrypted_history)} history messages (encrypted)')
@@ -470,7 +511,6 @@ def broadcast_encrypted_chat(sender_username, plaintext, exclude_conn=None):
             (u, i) for u, i in clients.items()
             if i.get('authenticated') and i['tcp'] != exclude_conn
         ]
-
     for uname, info in targets:
         session = info.get('session')
         try:
@@ -657,26 +697,27 @@ def handle_tcp_client(conn, addr):
 
                     # Expansion Worlds — generate identity (lore: world panel only, silent)
                     world_identity = None
-                    if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
-                        try:
-                            with clients_lock:
-                                online_now   = [u for u, i in clients.items()
-                                                if i.get('authenticated') and u != username]
-                                online_count = len(online_now) + 1
+                    with _world_state_lock:
+                        if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
+                            try:
+                                with clients_lock:
+                                    online_now   = [u for u, i in clients.items()
+                                                    if i.get('authenticated') and u != username]
+                                    online_count = len(online_now) + 1
 
-                            world_identity, _arrival_lore, _bond_lore, _prophecy_lore = \
-                                _world_state.register_user(username, online_users=online_now)
+                                world_identity, _arrival_lore, _bond_lore, _prophecy_lore = \
+                                    _world_state.register_user(username, online_users=online_now)
 
-                            # Choir (5+ users) or gathering (3-4) — silent, world panel only
-                            recent_types = [e.get('type') for e in _world_state.events[-4:]]
-                            if online_count >= 5 and 'choir' not in recent_types:
-                                _world_state.record_choir(online_count)
-                            elif online_count >= 3 and 'gathering' not in recent_types and 'choir' not in recent_types:
-                                _world_state.record_gathering(online_count)
+                                # Choir (5+ users) or gathering (3-4) — silent, world panel only
+                                recent_types = [e.get('type') for e in _world_state.events[-4:]]
+                                if online_count >= 5 and 'choir' not in recent_types:
+                                    _world_state.record_choir(online_count)
+                                elif online_count >= 3 and 'gathering' not in recent_types and 'choir' not in recent_types:
+                                    _world_state.record_gathering(online_count)
 
-                        except Exception as e:
-                            log_action(f'World identity error for {username}: {e}')
-                            world_identity = None
+                            except Exception as e:
+                                log_action(f'World identity error for {username}: {e}')
+                                world_identity = None
 
                     if world_identity:
                         send_json(conn, {
@@ -699,7 +740,8 @@ def handle_tcp_client(conn, addr):
                     send_chat_history(conn, session)
 
                     with clients_lock:
-                        user_list = [{'username': u, 'color': i.get('color')}
+                        user_list = [{'username': u, 'color': i.get('color'),
+                                      'has_voice': bool(i.get('udp_port', 0))}
                                       for u, i in clients.items() if i.get('authenticated')]
                     send_json(conn, {'type': 'userlist_full', 'users': user_list})
                     broadcast_full_userlist()
@@ -731,9 +773,60 @@ def handle_tcp_client(conn, addr):
                         continue
                     plaintext = plaintext[:MAX_MESSAGE_LENGTH]
                     if plaintext and username:
+                        if not _tcp_chat_rate_ok(username):
+                            log_action(f'Rate limit: dropping message from {username}')
+                            continue
                         log_action(f'Chat from {username}: {plaintext[:80]}')
                         broadcast_encrypted_chat(username, plaintext, exclude_conn=conn)
                         add_to_history(username, plaintext)
+
+                elif mtype == 'history_page':
+                    # Client requesting an older page of chat history
+                    req_page = msg.get('page', 2)
+                    req_n    = msg.get('n', 50)
+                    req_page = max(2, int(req_page))   # page 1 already sent on join
+                    req_n    = max(1, min(200, int(req_n)))
+                    try:
+                        with history_lock:
+                            mem_msgs = list(chat_history)
+                        try:
+                            afiles = sorted(f for f in os.listdir(LOGS_DIR)
+                                            if f.startswith('chat_') and f.endswith('.json'))
+                        except FileNotFoundError:
+                            afiles = []
+                        combined = []
+                        for af in afiles:
+                            combined.extend(_load_chat_archive(os.path.join(LOGS_DIR, af)))
+                        combined.extend(mem_msgs)
+                        skip  = req_n * (req_page - 1)
+                        total = len(combined)
+                        start = max(0, total - skip - req_n)
+                        end   = max(0, total - skip)
+                        page_msgs = combined[start:end]
+                        if page_msgs and session:
+                            enc_page = []
+                            for entry in page_msgs:
+                                try:
+                                    ct = session.encrypt_chat(entry.get('text', ''))
+                                    enc_page.append({
+                                        'user':      entry.get('user', ''),
+                                        'timestamp': entry.get('timestamp', ''),
+                                        'color':     entry.get('color'),
+                                        'encrypted': True,
+                                        'ct':        ct,
+                                    })
+                                except Exception:
+                                    continue
+                            if enc_page:
+                                send_json(conn, {
+                                    'type':    'chat_history_page',
+                                    'page':    req_page,
+                                    'history': enc_page,
+                                    'has_more': start > 0,
+                                })
+                    except Exception as e:
+                        log_action(f'history_page error for {username}: {e}')
+                    continue
 
                 elif mtype == 'ping':
                     try:
@@ -828,22 +921,23 @@ def handle_tcp_client(conn, addr):
             broadcast_encrypted_chat('System', leave_text)
             add_to_history('System', leave_text)
             # Expansion Worlds — record departure (silent: world panel only)
-            if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
-                try:
-                    _world_state.record_departure(username)
-                    with clients_lock:
-                        online_count  = sum(1 for i in clients.values() if i.get('authenticated'))
-                        other_conns   = [i['tcp'] for i in clients.values() if i.get('authenticated')]
-                    if online_count == 0:
-                        _world_state.record_silence()
-                    world_summary = _world_state.get_world_summary()
-                    for other_conn in other_conns:
-                        try:
-                            send_json(other_conn, {'type': 'world_update', 'summary': world_summary})
-                        except Exception:
-                            pass
-                except Exception as e:
-                    log_action(f'World departure error: {e}')
+            with _world_state_lock:
+                if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
+                    try:
+                        _world_state.record_departure(username)
+                        with clients_lock:
+                            online_count  = sum(1 for i in clients.values() if i.get('authenticated'))
+                            other_conns   = [i['tcp'] for i in clients.values() if i.get('authenticated')]
+                        if online_count == 0:
+                            _world_state.record_silence()
+                        world_summary = _world_state.get_world_summary()
+                        for other_conn in other_conns:
+                            try:
+                                send_json(other_conn, {'type': 'world_update', 'summary': world_summary})
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log_action(f'World departure error: {e}')
         conn.close()
 
 # ---------- Server Heartbeat --------------------------------------------------
@@ -933,6 +1027,17 @@ def udp_check_rate_limit(ip):
         ts.append(now)
         return True
 
+def _tcp_chat_rate_ok(username):
+    now = time.monotonic()
+    with _tcp_chat_rate_lock:
+        ts = _tcp_chat_rate[username]
+        while ts and now - ts[0] > TCP_CHAT_RATE_WINDOW:
+            ts.popleft()
+        if len(ts) >= TCP_CHAT_RATE_LIMIT:
+            return False
+        ts.append(now)
+        return True
+
 def udp_server():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.bind((UDP_HOST, UDP_PORT))
@@ -967,8 +1072,6 @@ def udp_server():
                 if pcm is None:
                     continue
 
-                # Encode sender username as a 1-byte length prefix so the
-                # client can apply per-user volume: [len(1)] [username(N)] [audio]
                 sender_bytes = sender.encode('utf-8')[:255]
                 header = bytes([len(sender_bytes)]) + sender_bytes
 
@@ -1028,6 +1131,7 @@ def _print_admin_banner():
     print("  /crypto              - Show crypto status")
     print("  /expansion [on|off]  - Toggle Expansion Worlds")
     print("  /save                - Save chat history")
+    print("  /logs                - List archive files")
     print("  /help                - This help")
     print("="*60)
 
@@ -1052,6 +1156,9 @@ def admin_console():
                         active_speakers.discard(username)
                     log_action(f'Admin kicked {username} ({ip})')
                     broadcast_full_userlist()
+                    kick_text = f'{username} has been removed from the chat'
+                    broadcast_encrypted_chat('System', kick_text)
+                    add_to_history('System', kick_text)
                     print(f'  ✓ Kicked {username}')
                 else:
                     print('  ✗ User not found')
@@ -1068,13 +1175,13 @@ def admin_console():
                     del clients[uname]
                     with active_speakers_lock:
                         active_speakers.discard(uname)
-            log_action(f'Admin banned {ip}'); broadcast_full_userlist()
+            log_action(f'Admin banned {ip}'); broadcast_full_userlist(); save_config()
             print(f'  ✓ Banned {ip}')
 
         elif cmd.startswith('/unban '):
             ip = cmd[7:].strip()
             if ip in BANNED_IPS:
-                BANNED_IPS.remove(ip); log_action(f'Unbanned {ip}'); print(f'  ✓ Unbanned {ip}')
+                BANNED_IPS.remove(ip); log_action(f'Unbanned {ip}'); save_config(); print(f'  ✓ Unbanned {ip}')
             else:
                 print('  ✗ Not in ban list')
 
@@ -1140,14 +1247,76 @@ def admin_console():
             print()
 
         elif cmd.startswith('/history'):
-            parts = cmd.split(); n = 10
+            # Usage: /history [n] [page]
+            #   n    = messages per page (default 20)
+            #   page = 1 = most recent, 2 = next older, etc.
+            parts = cmd.split()
+            n    = 20
+            page = 1
             if len(parts) > 1:
                 try: n = int(parts[1])
-                except: print('  ✗ Invalid number'); continue
+                except: print('  ✗ Usage: /history [n] [page]'); continue
+            if len(parts) > 2:
+                try: page = int(parts[2])
+                except: print('  ✗ Usage: /history [n] [page]'); continue
+            if n < 1 or page < 1:
+                print('  ✗ n and page must be >= 1'); continue
+
             with history_lock:
-                messages = list(chat_history)[-n:]
-            for m in messages:
-                print(f'  [{m["timestamp"]}] {m["user"]}: {m["text"]}')
+                mem_msgs = list(chat_history)
+
+            # Fast path: page 1 with enough messages already in memory
+            if page == 1 and len(mem_msgs) >= n:
+                display = mem_msgs[-n:]
+            else:
+                # Full path: stitch archives (oldest→newest) + memory into one list
+                try:
+                    afiles = sorted(f for f in os.listdir(LOGS_DIR)
+                                    if f.startswith('chat_') and f.endswith('.json'))
+                except FileNotFoundError:
+                    afiles = []
+                combined = []
+                for af in afiles:
+                    combined.extend(_load_chat_archive(os.path.join(LOGS_DIR, af)))
+                combined.extend(mem_msgs)
+
+                skip  = n * (page - 1)
+                total = len(combined)
+                start = max(0, total - skip - n)
+                end   = max(0, total - skip)
+                display = combined[start:end]
+
+            if display:
+                print(f'\n  Page {page} | {len(display)} messages'
+                      f' | {display[0].get("timestamp","?")} → {display[-1].get("timestamp","?")}')
+                print('  ' + '-'*56)
+                for m in display:
+                    print(f'  [{m["timestamp"]}] {m["user"]}: {m["text"]}')
+                print()
+                if len(display) == n:
+                    print(f'  Tip: /history {n} {page+1} for older messages')
+            else:
+                print(f'  No messages on page {page}.')
+            print()
+
+        elif cmd == '/logs':
+            # Show archive files available
+            try:
+                log_archives = sorted([f for f in os.listdir(LOGS_DIR) if f.startswith('server_') and f.endswith('.log')])
+                chat_archives = sorted([f for f in os.listdir(LOGS_DIR) if f.startswith('chat_') and f.endswith('.json')])
+            except FileNotFoundError:
+                log_archives = []; chat_archives = []
+            print(f'\n  Archive location : {LOGS_DIR}')
+            print(f'  Server log archives : {len(log_archives)}')
+            for f in log_archives[-5:]:
+                size = os.path.getsize(os.path.join(LOGS_DIR, f)) // 1024
+                print(f'    {f}  ({size} KB)')
+            if len(log_archives) > 5: print(f'    ... and {len(log_archives)-5} more')
+            print(f'  Chat history archives : {len(chat_archives)}')
+            for f in chat_archives[-5:]:
+                size = os.path.getsize(os.path.join(LOGS_DIR, f)) // 1024
+                print(f'    {f}  ({size} KB)')
+            if len(chat_archives) > 5: print(f'    ... and {len(chat_archives)-5} more')
             print()
 
         elif cmd == '/save':
@@ -1165,13 +1334,15 @@ def admin_console():
                     print('  ✗ haven_world.py not found in bin/')
                 else:
                     EXPANSION_ENABLED = True
-                    _init_world()
+                    with _world_state_lock:
+                        _init_world()
                     save_config()
                     log_action('Expansion Worlds enabled')
                     print('  ✓ Expansion Worlds enabled')
             elif parts[1] == 'off':
                 EXPANSION_ENABLED = False
-                _world_state = None
+                with _world_state_lock:
+                    _world_state = None
                 save_config()
                 log_action('Expansion Worlds disabled')
                 print('  ✓ Expansion Worlds disabled')
@@ -1179,14 +1350,25 @@ def admin_console():
                 print('  Usage: /expansion [on|off]')
 
         elif cmd == '/help':
-            print("  /kick /ban /unban /password /list /history /stats /crypto /expansion /save /help")
+            print("  /kick /ban /unban /password /list /history [n] [page] /stats /crypto /expansion /save /logs /help")
 
         else:
             if cmd: print('  ✗ Unknown command. /help for help.')
 
 # ---------- Entry Point -------------------------------------------------------
 
+def _shutdown_handler(signum, frame):
+    print("\n  Shutting down — saving data...")
+    save_chat_history()
+    save_config()
+    print("  ✓ Data saved. Goodbye.")
+    sys.exit(0)
+
 if __name__ == '__main__':
+    import signal
+    signal.signal(signal.SIGINT,  _shutdown_handler)
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+
     print("\n" + "="*60)
     print("  HAVEN CHAT SERVER  (PQ Secure Edition)")
     print("="*60 + "\n")
