@@ -13,8 +13,11 @@ import urllib.request
 import urllib.parse
 import io
 import webbrowser
-from datetime import datetime
+import datetime
 import hashlib
+import colorsys
+import math
+import random
 import random
 from pynput import keyboard, mouse
 
@@ -126,9 +129,17 @@ except ImportError as e:
     print(f"  Connection to server will be refused until this is resolved.\n")
 
 # ---------- Configuration ----------
+# ── Version ──────────────────────────────────────────────────────────────────
+HAVEN_VERSION   = '3.8'          # must match tag on GitHub release
+GITHUB_USER     = 'lewallen4'
+GITHUB_REPO     = 'Haven'
+# The updater expects a release tagged v3.2 etc. with:
+#   Haven.exe         — the binary
+#   SHA256SUMS.txt    — one line: <sha256hex>  Haven.exe
+
 SERVER_TCP_PORT = 5000
 SERVER_UDP_PORT = 5001
-MAX_TCP_BUFFER = 131072  # larger for encrypted payloads
+MAX_TCP_BUFFER = 1048576  # 1MB — large enough for full chat history payload
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Path helpers — centralised so frozen and dev stay consistent
@@ -521,7 +532,7 @@ class TofuMismatchDialog(tk.Toplevel):
         self.overrideredirect(True)
         self.resizable(False, False)
         self.transient(parent)
-        self.grab_set()
+        # (non-modal)
         apply_window_icon(self)
 
         inner = tk.Frame(self, bg=t['glass_bg'])
@@ -901,12 +912,14 @@ class LoginScreen(tk.Toplevel):
         self.configure(bg=self.t['login_bg'])
         self.resizable(False, False)
         self.overrideredirect(True)
-        self.geometry("420x560")
-
+        self.withdraw()
+        self.geometry("420x610")
         self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 210
-        y = (self.winfo_screenheight() // 2) - 280
-        self.geometry(f'420x560+{x}+{y}')
+        self.update()
+        x = (self.winfo_screenwidth()  // 2) - 210
+        y = (self.winfo_screenheight() // 2) - 305
+        self.geometry(f'420x610+{x}+{y}')
+        self.deiconify()
 
         # Apply haven.ico even to overrideredirect windows (may not show on all platforms)
         apply_window_icon(self)
@@ -995,7 +1008,15 @@ class LoginScreen(tk.Toplevel):
                                      font=('Segoe UI', 13, 'bold'), relief=tk.FLAT,
                                      command=self._submit, padx=20, pady=12,
                                      cursor='hand2', activebackground=self.t['accent_1'])
-        self.connect_btn.pack(pady=20, padx=30, fill=tk.X)
+        self.connect_btn.pack(pady=(20, 6), padx=30, fill=tk.X)
+
+        tk.Button(self, text="⬇  Check for Updates",
+                  bg=self.t['login_form_bg'], fg=self.t['login_sub_fg'],
+                  font=('Segoe UI', 9), relief=tk.FLAT,
+                  command=lambda: check_for_updates(self, self.t, silent=False),
+                  padx=20, pady=7, cursor='hand2',
+                  activebackground=self.t['glass_accent'],
+                  activeforeground=self.t['login_title_fg']).pack(padx=30, fill=tk.X)
 
         self.password_entry.bind('<Return>', lambda e: self._submit())
         self.ip_entry.bind('<Return>',       lambda e: self.username_entry.focus())
@@ -1059,7 +1080,7 @@ class ThemeDialog(tk.Toplevel):
         y = (self.winfo_screenheight() // 2) - 260
         self.geometry(f'340x520+{x}+{y}')
         self.transient(parent)
-        self.grab_set()
+        # (non-modal)
         apply_window_icon(self)
 
         build_themed_titlebar(self, theme, " ")
@@ -1153,7 +1174,7 @@ class ModernInputDialog(tk.Toplevel):
         y = (self.winfo_screenheight() // 2) - 110
         self.geometry(f'400x220+{x}+{y}')
         self.transient(parent)
-        self.grab_set()
+        # (non-modal)
         self.lift()
         self.attributes('-topmost', True)
         self.after(100, lambda: self.attributes('-topmost', False))
@@ -1215,7 +1236,7 @@ class KeybindDialog(tk.Toplevel):
         x = (self.winfo_screenwidth() // 2) - 225
         y = (self.winfo_screenheight() // 2) - 280
         self.geometry(f'450x560+{x}+{y}')
-        self.transient(parent); self.grab_set()
+        self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
         build_themed_titlebar(self, self.t, "Set Push-to-Talk Key")
@@ -1321,7 +1342,7 @@ class ColorPickerDialog(tk.Toplevel):
         x = (self.winfo_screenwidth() // 2) - 190
         y = (self.winfo_screenheight() // 2) - 235
         self.geometry(f'380x470+{x}+{y}')
-        self.transient(parent); self.grab_set()
+        self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
         build_themed_titlebar(self, self.t, " ")
@@ -1372,7 +1393,7 @@ class AudioDeviceDialog(tk.Toplevel):
         x = (self.winfo_screenwidth()  // 2) - dlg_w // 2
         y = (screen_h // 2) - dlg_h // 2
         self.geometry(f'{dlg_w}x{dlg_h}+{x}+{y}')
-        self.transient(parent); self.grab_set()
+        self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
         build_themed_titlebar(self, self.t, "Audio Devices & Volume")
@@ -1767,14 +1788,14 @@ class AboutDialog(tk.Toplevel):
         x = (self.winfo_screenwidth() // 2) - 240
         y = (self.winfo_screenheight() // 2) - 250
         self.geometry(f'480x500+{x}+{y}')
-        self.transient(parent); self.grab_set()
+        self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
         build_themed_titlebar(self, self.t, "About Haven")
 
         tk.Label(self, text="HAVEN", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 20, 'bold')).pack(pady=(20, 4))
-        tk.Label(self, text="v3.2", bg=self.t['glass_bg'], fg=self.t['accent_4'],
+        tk.Label(self, text=f"v{HAVEN_VERSION}", bg=self.t['glass_bg'], fg=self.t['accent_4'],
                  font=('Segoe UI', 11)).pack()
         tk.Label(self, text=f"Current theme: {theme.get('name', theme_name)}",
                  bg=self.t['glass_bg'], fg=self.t['fg_color'],
@@ -1809,7 +1830,404 @@ class AboutDialog(tk.Toplevel):
                   command=self.destroy, padx=40, pady=10, cursor='hand2').pack(pady=16)
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Auto-updater
+# =============================================================================
+
+def _github_api(path):
+    import urllib.request
+    url = f'https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}{path}'
+    req = urllib.request.Request(url, headers={
+        'Accept':     'application/vnd.github+json',
+        'User-Agent': f'Haven/{HAVEN_VERSION}',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def _download_file(url, dest_path, progress_cb=None):
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': f'Haven/{HAVEN_VERSION}'})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        total = int(r.headers.get('Content-Length', 0))
+        done  = 0
+        with open(dest_path, 'wb') as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk: break
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb: progress_cb(done, total)
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _themed_dialog(parent, theme, title, icon, message, buttons, width=420):
+    """
+    Generic themed modal dialog — same visual style as ColorPickerDialog.
+
+    buttons: list of (label, accent_key, return_value)
+             e.g. [("✓ Yes", 'accent_1', True), ("✕ No", 'accent_2', False)]
+
+    Returns the return_value of whichever button was clicked,
+    or None if the window is closed without clicking.
+    """
+    t = theme
+    result_holder = [None]
+
+    dlg = tk.Toplevel(parent)
+    dlg.configure(bg=t['accent_1'],           # 1px accent border via outer bg
+                  highlightthickness=0)
+    dlg.overrideredirect(True)
+    dlg.resizable(False, False)
+    dlg.transient(parent)
+    dlg.grab_set()
+    apply_window_icon(dlg)
+
+    inner = tk.Frame(dlg, bg=t['glass_bg'])
+    inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+    build_themed_titlebar(inner, t, title, on_close=lambda: dlg.destroy())
+
+    body = tk.Frame(inner, bg=t['glass_bg'])
+    body.pack(fill=tk.BOTH, expand=True, padx=24, pady=(18, 20))
+
+    # Icon + heading row
+    if icon:
+        tk.Label(body, text=icon, bg=t['glass_bg'], fg=t['accent_1'],
+                 font=('Segoe UI', 20)).pack(anchor='w', pady=(0, 6))
+
+    # Message text — wrap at width - margins
+    tk.Label(body, text=message, bg=t['glass_bg'], fg=t['fg_color'],
+             font=('Segoe UI', 10), justify='left',
+             wraplength=width - 60, anchor='w').pack(anchor='w', pady=(0, 18))
+
+    tk.Frame(body, bg=t['titlebar_sep'], height=1).pack(fill='x', pady=(0, 14))
+
+    btn_row = tk.Frame(body, bg=t['glass_bg'])
+    btn_row.pack(anchor='e')
+
+    def _click(val):
+        result_holder[0] = val
+        try: dlg.destroy()
+        except: pass
+
+    for label, accent_key, val in buttons:
+        bg = t.get(accent_key, t['accent_1'])
+        fg = t.get('send_btn_fg', '#ffffff')
+        tk.Button(btn_row, text=label, bg=bg, fg=fg,
+                  font=('Segoe UI', 10, 'bold'), relief=tk.FLAT,
+                  padx=18, pady=8, cursor='hand2',
+                  command=lambda v=val: _click(v)).pack(side='left', padx=(0, 8))
+
+    # Size and centre — withdraw first so the window doesn't flash at 0,0
+    dlg.withdraw()
+    dlg.update_idletasks()
+    dlg.update()
+    w  = max(dlg.winfo_reqwidth(), width)
+    h  = dlg.winfo_reqheight()
+    px = (dlg.winfo_screenwidth()  - w) // 2
+    py = (dlg.winfo_screenheight() - h) // 2
+    dlg.geometry(f'{w}x{h}+{px}+{py}')
+    dlg.deiconify()
+    dlg.lift()
+    dlg.attributes('-topmost', True)
+    dlg.after(100, lambda: dlg.attributes('-topmost', False))
+    dlg.focus_force()
+
+    parent.wait_window(dlg)
+    return result_holder[0]
+
+
+def _themed_info(parent, theme, title, icon, message, width=420):
+    """Convenience wrapper for a single-button info dialog."""
+    _themed_dialog(parent, theme, title, icon, message,
+                   [("✓  OK", 'accent_1', True)], width=width)
+
+
+def _themed_error(parent, theme, title, message, width=420):
+    """Convenience wrapper for a single-button error dialog."""
+    _themed_dialog(parent, theme, title, '✕', message,
+                   [("OK", 'accent_2', True)], width=width)
+
+
+def _themed_yesno(parent, theme, title, icon, message, yes_label="✓  Yes",
+                  no_label="✕  No", width=420):
+    """Convenience wrapper for a yes/no confirmation dialog."""
+    return _themed_dialog(parent, theme, title, icon, message,
+                          [(yes_label, 'accent_1', True),
+                           (no_label,  'accent_2', False)], width=width)
+
+
+def check_for_updates(parent, theme, silent=False):
+    t = theme
+
+    # Show a "Checking..." window immediately so the UI doesn't freeze
+    checking_win = [None]
+    if not silent:
+        cw = tk.Toplevel(parent)
+        cw.configure(bg=t['accent_1'], highlightthickness=0)
+        cw.overrideredirect(True)
+        cw.resizable(False, False)
+        cw.transient(parent)
+        apply_window_icon(cw)
+        _ci = tk.Frame(cw, bg=t['glass_bg'])
+        _ci.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        build_themed_titlebar(_ci, t, "Checking for Updates...")
+        _cb = tk.Frame(_ci, bg=t['glass_bg'])
+        _cb.pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+        tk.Label(_cb, text='✦', bg=t['glass_bg'], fg=t['accent_1'],
+                 font=('Segoe UI', 20)).pack(anchor='w', pady=(0, 6))
+        tk.Label(_cb, text=f"Contacting GitHub...\nChecking for updates to v{HAVEN_VERSION}.",
+                 bg=t['glass_bg'], fg=t['fg_color'],
+                 font=('Segoe UI', 10), justify='left').pack(anchor='w')
+        cw.withdraw()
+        cw.update_idletasks()
+        cw.update()
+        _cw, _ch = 380, cw.winfo_reqheight()
+        cw.geometry(f'{_cw}x{_ch}+'
+                    f'{(cw.winfo_screenwidth()  - _cw) // 2}+'
+                    f'{(cw.winfo_screenheight() - _ch) // 2}')
+        cw.deiconify()
+        cw.lift()
+        cw.attributes('-topmost', True)
+        cw.after(100, lambda: cw.attributes('-topmost', False))
+        cw.update()
+        checking_win[0] = cw
+
+    def _close_checking():
+        try:
+            if checking_win[0]: checking_win[0].destroy()
+        except: pass
+        checking_win[0] = None
+
+    def _do_check():
+        data = _github_api('/releases/latest')
+        parent.after(0, lambda: _on_result(data))
+
+    def _on_result(data):
+        _close_checking()
+        if not data:
+            if not silent:
+                _themed_error(parent, t, "Update Check Failed",
+                              "Could not reach GitHub.\nCheck your internet connection.")
+            return
+        tag = data.get('tag_name', '').lstrip('v')
+        if not tag:
+            if not silent:
+                _themed_error(parent, t, "Update Check Failed",
+                              "Could not read version from GitHub release.")
+            return
+        def _ver(s):
+            try:    return tuple(int(x) for x in s.split('.'))
+            except: return (0,)
+        if _ver(tag) <= _ver(HAVEN_VERSION):
+            if not silent:
+                _themed_info(parent, t, "Haven — Up to Date", '✦',
+                             f"You are running the latest version.\n\nv{HAVEN_VERSION}  ·  no update available")
+            return
+        assets   = {a['name']: a['browser_download_url'] for a in data.get('assets', [])}
+        exe_url  = assets.get('Haven.exe')
+        sums_url = assets.get('SHA256SUMS.txt')
+        if not exe_url:
+            if not silent:
+                _themed_error(parent, t, "Update Check Failed",
+                              f"v{tag} is available but no Haven.exe asset was found.")
+            return
+        notes = (data.get('body') or '').strip()[:400]
+        update_msg = f"Haven v{tag} is available.\nYou are on v{HAVEN_VERSION}."
+        if notes:
+            update_msg += f"\n\n{notes}"
+        update_msg += "\n\nDownload and install now?"
+        if not _themed_yesno(parent, t, "Haven — Update Available", '⬡',
+                             update_msg,
+                             yes_label="⬇  Download & Install",
+                             no_label="✕  Not Now",
+                             width=460):
+            return
+        # proceed to download — build progress window and kick off download thread
+        prog_win = tk.Toplevel(parent)
+        prog_win.configure(bg=t['accent_1'], highlightthickness=0)
+        prog_win.overrideredirect(True)
+        prog_win.resizable(False, False)
+        prog_win.transient(parent)
+        prog_win.grab_set()
+        apply_window_icon(prog_win)
+
+        prog_inner = tk.Frame(prog_win, bg=t['glass_bg'])
+        prog_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        build_themed_titlebar(prog_inner, t, f"Downloading Haven v{tag}...")
+
+        prog_body = tk.Frame(prog_inner, bg=t['glass_bg'])
+        prog_body.pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+
+        tk.Label(prog_body, text="\u2b07  Downloading Haven.exe",
+                 bg=t['glass_bg'], fg=t['accent_1'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(0, 10))
+
+        bar_bg = tk.Frame(prog_body, bg=t['glass_accent'], height=10)
+        bar_bg.pack(fill='x', pady=(0, 6))
+        bar_bg.pack_propagate(False)
+
+        bar_fill = tk.Frame(bar_bg, bg=t['accent_1'], height=10, width=0)
+        bar_fill.place(x=0, y=0, relheight=1, width=0)
+
+        prog_pct = tk.Label(prog_body, text="0%",
+                            bg=t['glass_bg'], fg=t['accent_4'],
+                            font=('Segoe UI', 9))
+        prog_pct.pack(anchor='e')
+
+        prog_win.withdraw()
+        prog_win.update_idletasks()
+        prog_win.update()
+        pw = 400
+        ph = prog_win.winfo_reqheight()
+        prog_win.geometry(
+            f'{pw}x{ph}+'
+            f'{(prog_win.winfo_screenwidth()  - pw) // 2}+'
+            f'{(prog_win.winfo_screenheight() - ph) // 2}')
+        prog_win.deiconify()
+        prog_win.lift()
+        prog_win.attributes('-topmost', True)
+        prog_win.after(100, lambda: prog_win.attributes('-topmost', False))
+        prog_win.update()
+
+        import tempfile, sys, subprocess as _sp
+        tmp_exe  = os.path.join(tempfile.gettempdir(), f'Haven_v{tag}.exe')
+        tmp_sums = os.path.join(tempfile.gettempdir(), f'Haven_v{tag}_SHA256SUMS.txt')
+        error_holder = [None]
+
+        def _cleanup(paths):
+            for p in paths:
+                try:
+                    if os.path.exists(p): os.remove(p)
+                except: pass
+
+        def _progress(done, total):
+            if total and prog_win.winfo_exists():
+                pct = done / total
+                try:
+                    bar_bg.update_idletasks()
+                    bar_w = bar_bg.winfo_width()
+                    fill_w = max(0, int(bar_w * pct))
+                    parent.after(0, lambda fw=fill_w, p=pct: (
+                        bar_fill.place_configure(width=fw),
+                        prog_pct.config(text=f"{int(p * 100)}%"),
+                    ))
+                except Exception:
+                    pass
+
+        def _do_download():
+            try:
+                _download_file(exe_url, tmp_exe, _progress)
+                if sums_url:
+                    _download_file(sums_url, tmp_sums)
+            except Exception as e:
+                error_holder[0] = str(e)
+            finally:
+                parent.after(0, _download_done)
+
+        def _download_done():
+            try: prog_win.destroy()
+            except: pass
+
+            if error_holder[0]:
+                _themed_error(parent, t, "Haven \u2014 Download Failed",
+                              f"The download could not be completed.\n\n{error_holder[0]}")
+                _cleanup([tmp_exe, tmp_sums])
+                return
+
+            actual_hash = _sha256_file(tmp_exe)
+
+            if sums_url and os.path.exists(tmp_sums):
+                expected_hash = None
+                try:
+                    for line in open(tmp_sums).read().splitlines():
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].strip('* ') == 'Haven.exe':
+                            expected_hash = parts[0].lower(); break
+                except: pass
+
+                if expected_hash and actual_hash.lower() != expected_hash:
+                    _themed_error(parent, t, "Haven \u2014 Security Error",
+                                  f"Checksum mismatch \u2014 the file has been deleted.\n\n"
+                                  f"Expected:\n{expected_hash}\n\nGot:\n{actual_hash}")
+                    _cleanup([tmp_exe, tmp_sums])
+                    return
+                elif not expected_hash:
+                    if not _themed_yesno(parent, t, "Haven \u2014 Checksum Warning", '\u26a0',
+                                         f"Could not parse SHA256SUMS.txt.\n\n"
+                                         f"SHA-256:  {actual_hash}\n\nInstall anyway?",
+                                         yes_label="\u26a0  Install Anyway",
+                                         no_label="\u2715  Cancel"):
+                        _cleanup([tmp_exe, tmp_sums])
+                        return
+            else:
+                if not _themed_yesno(parent, t, "Haven \u2014 No Checksum", '\u26a0',
+                                     f"No SHA256SUMS.txt was found in this release.\n\n"
+                                     f"SHA-256:  {actual_hash}\n\nInstall anyway?",
+                                     yes_label="\u26a0  Install Anyway",
+                                     no_label="\u2715  Cancel"):
+                    _cleanup([tmp_exe, tmp_sums])
+                    return
+
+            current_exe = sys.executable if getattr(sys, 'frozen', False) else None
+            if not current_exe or not current_exe.lower().endswith('.exe'):
+                _themed_info(parent, t, "Haven \u2014 Downloaded", '\u2726',
+                             f"Update saved to:\n{tmp_exe}\n\nReplace Haven.exe manually to complete.")
+                _cleanup([tmp_sums])
+                return
+
+            old_exe = current_exe.replace('.exe', '.old.exe')
+            try:
+                if os.path.exists(old_exe):
+                    os.remove(old_exe)
+                os.rename(current_exe, old_exe)
+            except Exception as e:
+                _themed_error(parent, t, "Haven \u2014 Install Failed",
+                              f"Could not rename Haven.exe:\n\n{e}")
+                _cleanup([tmp_sums])
+                return
+
+            try:
+                import shutil
+                shutil.move(tmp_exe, current_exe)
+            except Exception as e:
+                try: os.rename(old_exe, current_exe)
+                except: pass
+                _themed_error(parent, t, "Haven \u2014 Install Failed",
+                              f"Could not place new Haven.exe:\n\n{e}")
+                _cleanup([tmp_sums])
+                return
+
+            _cleanup([tmp_sums])
+            _themed_info(parent, t, "Haven \u2014 Update Complete", '\u2726',
+                         f"Haven v{tag} installed successfully.\n\nPlease restart Haven to use the new version.")
+            try:
+                parent.destroy()
+            except Exception:
+                pass
+            import sys as _sys
+            _sys.exit(0)
+
+        import threading
+        threading.Thread(target=_do_download, daemon=True).start()
+
+    # Kick off the GitHub API check on a background thread — never blocks the UI
+    import threading
+    threading.Thread(target=_do_check, daemon=True).start()
+
 # Main client
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1936,7 +2354,7 @@ class SoundSettingsDialog(tk.Toplevel):
         self.lift()
         self.attributes('-topmost', True)
         self.after(100, lambda: self.attributes('-topmost', False))
-        self.grab_set()
+        # (non-modal)
 
     def _save(self):
         self.on_save(
@@ -2015,7 +2433,7 @@ class LoreBookDialog(tk.Toplevel):
         self.lift()
         self.attributes('-topmost', True)
         self.after(100, lambda: self.attributes('-topmost', False))
-        self.grab_set()
+        # (non-modal)
 
     def _switch_page(self, idx):
         t = self.t
@@ -2207,7 +2625,6 @@ class LoreBookDialog(tk.Toplevel):
             self._lbl(p, "The record is empty.", italic=True, color=t['accent_4'])
             return
 
-        import time as _time
         type_colors = {
             'first_arrival': t.get('accent_1','#00ff88'),
             'arrival':       t['fg_color'],
@@ -2222,7 +2639,6 @@ class LoreBookDialog(tk.Toplevel):
             ts    = e.get('timestamp', 0)
             color = type_colors.get(etype, t['fg_color'])
             if ts:
-                import datetime
                 dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
                 self._lbl(p, dt, color=t['accent_4'], size=7, pady=6)
             self._lbl(p, e.get('text',''), color=color, italic=True, pady=1)
@@ -2250,6 +2666,8 @@ class HavenClient:
         self._world_summary     = None      # latest world summary from server
         self._expansion_enabled = False     # whether server has expansion worlds on
         self.saved_wire_hash = None   # SHA256(password) for reconnect — never plaintext
+        self.authenticated   = False  # set True after auth_ok
+        self._child_windows  = []      # open non-modal dialogs — lifted on restore
 
         # UI widget refs (set in build_ui, cleared in rebuild_ui)
         self.canvas_bg       = None
@@ -2352,11 +2770,24 @@ class HavenClient:
         self.root.geometry(f"{ww}x{wh}+{sw//2-ww//2}+{sh//2-wh//2}")
         self.root.minsize(800, 500)
         self.root.resizable(True, True)
-        self.root.overrideredirect(True)
+        _IS_LINUX = sys.platform.startswith('linux')
+        if _IS_LINUX:
+            # On Linux/X11, overrideredirect(True) prevents the WM from routing
+            # keyboard events — the window renders but can't receive typing.
+            # Use splash/override window type instead: borderless but focusable.
+            try:
+                self.root.wm_attributes('-type', 'splash')
+            except Exception:
+                pass  # Wayland or older X11 — fall back gracefully
+        else:
+            self.root.overrideredirect(True)
         self.root.lift()
         self.root.focus_force()
         self.root.attributes('-topmost', True)
         self.root.after(100, lambda: self.root.attributes('-topmost', False))
+        if _IS_LINUX:
+            # Re-request focus after event loop settles on Linux
+            self.root.after(200, lambda: self.root.focus_force())
         self.root.configure(bg=self.theme['bg_color'])
         apply_window_icon(self.root)
 
@@ -2377,6 +2808,7 @@ class HavenClient:
 
         self.setup_global_hotkey()
         self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+        self.root.bind("<Map>", lambda e: self.root.after(100, self._lift_children))
         self.root.mainloop()
 
     # ── System Tray ──────────────────────────────────────────────
@@ -2409,6 +2841,7 @@ class HavenClient:
         self.root.focus_force()
         self.root.attributes('-topmost', True)
         self.root.after(100, lambda: self.root.attributes('-topmost', False))
+        self.root.after(150, self._lift_children)
 
     def minimize_to_tray(self):
         # Only hide the window — do NOT touch self.running or the TCP connection.
@@ -2618,6 +3051,9 @@ class HavenClient:
                             self.name_color = msg['user_color']
                         crypto_info = msg.get('crypto', {})
                         pass  # crypto active — no console noise
+                        # Silent startup update check (non-blocking)
+                        import threading as _ut
+                        _ut.Thread(target=lambda: self.root.after(5000, lambda: check_for_updates(self.root, self.theme, silent=True)), daemon=True).start()
                         return 'ok'
                     elif msg['type'] == 'auth_failed':
                         tcp_sock.close(); udp_sock.close(); return 'auth_failed'
@@ -2794,6 +3230,14 @@ class HavenClient:
                 self._saved_win_h = event.height
         self.root.bind('<Configure>', _on_resize)
 
+        # On Linux: re-focus the entry widget whenever the window gets focus
+        # (compensates for WM occasionally stealing focus back)
+        if sys.platform.startswith('linux'):
+            def _linux_focus_fix(e):
+                if self.msg_entry and self.msg_entry.winfo_exists():
+                    self.root.after(50, self.msg_entry.focus_set)
+            self.root.bind('<FocusIn>', _linux_focus_fix)
+
         # ── Edge/corner resize handles for overrideredirect window ────────────
         GRIP = 6  # px — invisible hit area on each edge
 
@@ -2878,6 +3322,8 @@ class HavenClient:
                                  state=tk.DISABLED, font=('Segoe UI', t['chat_font_size']),
                                  relief=tk.FLAT, padx=15, pady=15, spacing3=5)
         self.chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Disable Tkinter's built-in edge-proximity auto-scroll on mouse motion
+        self.chat_text.bind('<Motion>', lambda e: 'break')
 
         scrollbar = make_scrollbar(chat_container, t, command=self.chat_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -3056,7 +3502,7 @@ class HavenClient:
             return
         dialog = LoreBookDialog(self.root, self.theme, self._world_summary,
                                 self._world_identities.get(self.username, {}))
-        self.root.wait_window(dialog)
+        self._track_dialog(dialog)
 
     def _refresh_world_panel(self):
         """Populate the world lore panel with current summary."""
@@ -3163,8 +3609,34 @@ class HavenClient:
             y = (i + 1) * (h / 6)
             self.canvas_bg.create_line(0, y, w, y, fill=gl, width=1, dash=(10, 20), stipple='gray50')
 
+    def _track_dialog(self, win):
+        """Register a non-modal dialog so it gets lifted on window restore."""
+        self._child_windows.append(win)
+        def _on_destroy(e=None):
+            try: self._child_windows.remove(win)
+            except ValueError: pass
+        win.bind('<Destroy>', _on_destroy)
+
+    def _lift_children(self):
+        """Bring all tracked child dialogs above the main window."""
+        dead = []
+        for w in list(self._child_windows):
+            try:
+                if w.winfo_exists():
+                    w.deiconify()
+                    w.lift()
+                    w.focus_force()
+                else:
+                    dead.append(w)
+            except Exception:
+                dead.append(w)
+        for w in dead:
+            try: self._child_windows.remove(w)
+            except ValueError: pass
+
     def show_about(self):
         dlg = AboutDialog(self.root, self.theme, self.theme_name)
+        self._track_dialog(dlg)
         self.root.wait_window(dlg)
 
     def format_key_display(self, key):
@@ -3270,18 +3742,21 @@ class HavenClient:
         buffer = getattr(self, '_tcp_buffer', '')
         self._tcp_buffer = ''
         while self.running:
+            # Drain all complete messages first, then check size
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 if not line.strip(): continue
                 try: msg = json.loads(line)
                 except json.JSONDecodeError: continue
                 self.root.after(0, lambda m=msg: self.handle_tcp_message(m))
+            # Only check overflow after draining — large history arrives in
+            # multiple chunks and may briefly exceed the limit mid-message
+            if len(buffer) > MAX_TCP_BUFFER:
+                print("TCP buffer overflow — disconnecting"); break
             try:
-                data = self.tcp_sock.recv(4096).decode('utf-8', errors='replace')
+                data = self.tcp_sock.recv(8192).decode('utf-8', errors='replace')
                 if not data: break
                 buffer += data
-                if len(buffer) > MAX_TCP_BUFFER:
-                    print("TCP buffer overflow — disconnecting"); break
             except ssl.SSLError: break
             except OSError: break
             except Exception: break
@@ -3462,9 +3937,21 @@ class HavenClient:
             if 'user_color' in msg:
                 self.name_color = msg['user_color']; self.server_assigned_color = msg['user_color']
             self.save_config()
+            # Remove old user card completely (label + sigil canvas)
             if old_username in self.speaker_labels:
-                self.speaker_labels[old_username].destroy(); del self.speaker_labels[old_username]
-            self.add_user_to_list(self.username, self.name_color)
+                try:
+                    # Destroy the whole card frame not just the label
+                    self.speaker_labels[old_username].master.master.destroy()
+                except Exception:
+                    try: self.speaker_labels[old_username].destroy()
+                    except: pass
+                del self.speaker_labels[old_username]
+            if old_username in self._sigil_canvases:
+                del self._sigil_canvases[old_username]
+            if old_username in self.user_colors:
+                self.user_colors[self.username] = self.user_colors.pop(old_username)
+            # Add fresh card with new name — sigil redraws from new username seed
+            self.add_user_to_list(self.username, self.name_color, has_voice=True)
         elif msg['type'] == 'world_identity':
             self._expansion_enabled = True
             identity = msg.get('identity', {})
@@ -3583,8 +4070,7 @@ class HavenClient:
 
     def send_chat(self, event=None):
         # Throttle: ignore key-repeat events (held Return key fires many times/sec)
-        import time as _time
-        now = _time.monotonic()
+        import time as _time; now = _time.monotonic()
         if now - self._last_send_time < 0.1:
             return
         self._last_send_time = now
@@ -3602,8 +4088,9 @@ class HavenClient:
                 play_sound('msg_sent', self.sounds_enabled, sfx_vol=getattr(self,'sfx_volume',100))
             except UnicodeEncodeError:
                 messagebox.showerror("Error", "Message contains unsupported characters")
-            except Exception:
-                messagebox.showerror("Error", "Failed to send message")
+            except Exception as _e:
+                import traceback; traceback.print_exc()
+                messagebox.showerror("Error", f"Failed to send message: {_e}")
 
     def open_emoji_picker(self):
         if self._emoji_picker and self._emoji_picker.winfo_exists():
@@ -3644,7 +4131,7 @@ class HavenClient:
         """
         t = self.theme
         if not self.chat_text: return
-        if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
+        if timestamp is None: timestamp = datetime.datetime.now().strftime('%H:%M')
         text = self._safe_text(text)   # strip lone surrogates that crash tkinter
 
         # "Segoe UI" matches the entry widget font — familiar, readable
@@ -3695,7 +4182,7 @@ class HavenClient:
         """Render a system/status line."""
         t = self.theme
         if not self.chat_text: return
-        if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
+        if timestamp is None: timestamp = datetime.datetime.now().strftime('%H:%M')
         self.chat_text.config(state=tk.NORMAL)
         self._chat_insert(tk.END, f'[{timestamp}] ', 'sys_ts')
         self._chat_insert(tk.END, f'{text}\n', 'sys_line')
@@ -3964,7 +4451,7 @@ class HavenClient:
     # ── Public display methods ────────────────────────────────────
 
     def display_message(self, user, text, align='left', timestamp=None, color=None, from_history=False):
-        if timestamp is None: timestamp = datetime.now().strftime('%H:%M')
+        if timestamp is None: timestamp = datetime.datetime.now().strftime('%H:%M')
 
         # System message visibility: hide from non-admins
         if user == 'System':
@@ -4021,7 +4508,7 @@ class HavenClient:
         is_admin = getattr(self, 'username', '').startswith('admin_')
         if not local_only and not is_admin:
             return  # non-admins don't see server system messages
-        ts = datetime.now().strftime('%H:%M')
+        ts = datetime.datetime.now().strftime('%H:%M')
         self._msg_log.append({'type': 'system', 'text': text, 'timestamp': ts})
         self._render_sys(text, ts)
 
@@ -4037,11 +4524,13 @@ class HavenClient:
             self.user_colors[user_data['username']] = user_data.get('color', self.theme['accent_2'])
         for user_data in users_with_colors:
             username = user_data['username']
-            self.add_user_to_list(username, self.user_colors[username])
+            # has_voice=True if the client registered a UDP port (False for terminal clients)
+            has_voice = user_data.get('has_voice', True)  # default True for legacy servers
+            self.add_user_to_list(username, self.user_colors[username], has_voice=has_voice)
         if self.username not in self.user_colors:
             self.user_colors[self.username] = self.name_color
 
-    def add_user_to_list(self, username, color):
+    def add_user_to_list(self, username, color, has_voice=True):
         t        = self.theme
         identity = self._world_identities.get(username)
 
@@ -4056,10 +4545,14 @@ class HavenClient:
 
             # Sigil — rendered from SVG as a PhotoImage via base64 PNG fallback
             # We draw the sigil on a small canvas using tkinter geometry
-            sigil_canvas = tk.Canvas(inner, width=28, height=28,
+            sigil_canvas = tk.Canvas(inner, width=44, height=44,
                                      bg=t['userlist_card_bg'], highlightthickness=0)
             sigil_canvas.pack(side=tk.LEFT, padx=(0, 6))
-            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=28)
+            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=44)
+            if not has_voice:
+                # Zalgo effect — ghost sigils tiled across the card
+                # Shows they exist but aren't voice-present
+                self._draw_zalgo_overlay(card, username, color)
             self._sigil_canvases[username] = (sigil_canvas, color)
 
             right = tk.Frame(inner, bg=t['userlist_card_bg'])
@@ -4082,24 +4575,28 @@ class HavenClient:
             self._bind_world_tooltip(label, identity)
         else:
             # ── Standard card ─────────────────────────────────────────────
-            label = tk.Label(card, text=f"● {username}",
+            # Add a small "no-voice" indicator glyph when the user is terminal-only
+            prefix = "◌ " if not has_voice else "● "
+            label = tk.Label(card, text=f"{prefix}{username}",
                              bg=t['userlist_card_bg'], fg=color,
                              font=('Segoe UI', 10), anchor='w', padx=10, pady=8)
             label.pack(fill=tk.X)
+            if not has_voice:
+                self._draw_zalgo_overlay(card, username, color)
 
         self.speaker_labels[username] = label
         if username in self.active_speakers:
             self.set_user_voice_active(username, True)
 
-    def _draw_sigil_on_canvas(self, canvas, username, color, size=28, rotation_offset=0):
-        """Draw a deterministic sigil on a tk.Canvas using pure tkinter geometry."""
-        import hashlib, math
-        cx = size / 2
-        cy = size / 2
+    def _draw_sigil_on_canvas(self, canvas, username, color, size=28, rotation_offset=0, offset=None):
+        """Draw a deterministic sigil on a tk.Canvas using pure tkinter geometry.
+        offset=(x,y) shifts the drawing origin — used for zalgo tiling."""
+        ox, oy = offset if offset else (0, 0)
+        cx = ox + size / 2
+        cy = oy + size / 2
         radius = size * 0.38
 
         def _rng_local(seed):
-            import random
             h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
             return random.Random(h)
 
@@ -4180,6 +4677,87 @@ class HavenClient:
                                rune_pts[0][0] + dot_r, rune_pts[0][1] + dot_r,
                                fill=color, outline='')
 
+    def _draw_zalgo_overlay(self, card, username, color):
+        """
+        Tile faded ghost-sigils across the user card to show a terminal/no-voice
+        user. The sigil is recognisable but fragmented — 'lost in the sauce'.
+
+        Strategy: place a canvas as the card background FIRST, then lift all
+        existing children (text labels, sigil canvas) above it so they remain
+        readable. The canvas is drawn at card-level via place() so it fills the
+        whole card behind the packed widgets.
+        """
+        t = self.theme
+
+        # Dim the color way down so it ghosts behind the text
+        def _dim(hex_color, alpha=0.22):
+            try:
+                h = hex_color.lstrip('#')
+                r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+                bg_h = t['userlist_card_bg'].lstrip('#')
+                br, bg_c, bb = int(bg_h[0:2],16), int(bg_h[2:4],16), int(bg_h[4:6],16)
+                nr = int(br + (r - br) * alpha)
+                ng = int(bg_c + (g - bg_c) * alpha)
+                nb = int(bb + (b - bb) * alpha)
+                return f'#{nr:02x}{ng:02x}{nb:02x}'
+            except Exception:
+                return t.get('accent_4', '#444444')
+
+        ghost_color = _dim(color, 0.22)
+
+        def _do_draw(event=None):
+            try:
+                w = card.winfo_width()
+                h = card.winfo_height()
+                if w < 4 or h < 4:
+                    card.after(50, _do_draw)
+                    return
+
+                # Create the overlay canvas with the card's own bg colour (safe, no blank bg)
+                ov = tk.Canvas(card, bg=t['userlist_card_bg'], highlightthickness=0,
+                               width=w, height=h)
+                # Place it to fill the whole card — it goes under pack-managed widgets
+                # by being placed at z-order bottom
+                ov.place(x=0, y=0, relwidth=1, relheight=1)
+                ov.lower()   # send behind all packed children
+
+                # Tile small ghost sigils across the card
+                tile = 18   # size of each ghost sigil
+                gap  = 6    # gap between tiles
+                step = tile + gap
+
+                rng = random.Random(int(hashlib.sha256(f'zalgo:{username}'.encode()).hexdigest(), 16))
+
+                for row_y in range(-tile, h + tile, step):
+                    # Offset every other row for a staggered/chaotic feel
+                    x_off = rng.randint(0, step) if (row_y // step) % 2 else 0
+                    for col_x in range(-tile + x_off, w + tile, step):
+                        # Slight random jitter
+                        jx = col_x + rng.randint(-3, 3)
+                        jy = row_y + rng.randint(-3, 3)
+                        # Random rotation offset per tile
+                        rot = rng.uniform(0, 360)
+                        self._draw_sigil_on_canvas(
+                            ov, username, ghost_color,
+                            size=tile,
+                            rotation_offset=rot,
+                            offset=(jx, jy)
+                        )
+
+                # Lift all existing packed children above the overlay canvas
+                for child in card.winfo_children():
+                    if child is not ov:
+                        try:
+                            child.lift()
+                        except Exception:
+                            pass
+
+            except Exception:
+                pass
+
+        card.bind('<Map>', _do_draw)
+        card.after(80, _do_draw)   # fallback for already-visible cards
+
     # ── Sigil animation helpers ────────────────────────────────────────────────
 
     def _hex_to_rgb(self, color):
@@ -4187,7 +4765,6 @@ class HavenClient:
         return int(h[0:2],16)/255, int(h[2:4],16)/255, int(h[4:6],16)/255
 
     def _boost_color(self, color, factor):
-        import colorsys
         try:
             r_v, g_v, b_v = self._hex_to_rgb(color)
             hh, ss, vv = colorsys.rgb_to_hsv(r_v, g_v, b_v)
@@ -4217,36 +4794,32 @@ class HavenClient:
           - Outward glowing rings emanate from center
           - 16ms tick (~60fps feel)
         """
-        import math
         if not canvas.winfo_exists(): return
         if username not in self.active_speakers:
             # User stopped — play sparkle burst then restore static sigil
             self._sparkle_sigil(canvas, username, color, _frames=0)
             return
 
-        size   = 28
+        size   = 44
         cx, cy = size / 2, size / 2
         phase  = _phase  # unbounded, wraps naturally in trig
 
         canvas.delete('all')
 
-        # ── Outward glow rings ────────────────────────────────────────────────
-        # Two rings, offset in phase, expanding outward and fading
+        # ── Outward glow rings — start inside sigil boundary, expand outward ──
         for ring_offset in [0, 15]:
             ring_phase = (phase + ring_offset) % 30
-            # Radius grows from 10 → 18 over 30 frames
-            r_min, r_max = 10, 18
+            # Radius grows from 14 → 21 over 30 frames (stays within 44px canvas)
+            r_min, r_max = 14, 21
             ring_r  = r_min + (r_max - r_min) * (ring_phase / 30)
-            # Alpha fades from 0.5 → 0 as ring expands
-            ring_alpha = 0.5 * (1.0 - ring_phase / 30)
+            # Alpha fades from 0.55 → 0 as ring expands
+            ring_alpha = 0.55 * (1.0 - ring_phase / 30)
             ring_color = self._color_with_alpha(color, ring_alpha)
-            # Draw as thick oval outline
             thickness = max(1, int(3 * (1.0 - ring_phase / 30)))
             canvas.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
                                outline=ring_color, width=thickness)
 
         # ── Rotating sigil ────────────────────────────────────────────────────
-        # Boost color slightly while speaking
         speak_color = self._boost_color(color, 1.3)
         rotation_deg = (phase * 3) % 360  # 3 deg/frame = ~1 full rotation/2 sec
         self._draw_sigil_on_canvas(canvas, username, speak_color, size=size,
@@ -4258,12 +4831,11 @@ class HavenClient:
         """
         Post-voice sparkle burst: 8 dots fly outward from center and fade over ~500ms.
         """
-        import math
         if not canvas.winfo_exists(): return
         if username in self.active_speakers: return  # started speaking again
 
         TOTAL_FRAMES = 20
-        size = 28; cx = size / 2; cy = size / 2
+        size = 44; cx = size / 2; cy = size / 2
 
         canvas.delete('all')
 
@@ -4275,7 +4847,7 @@ class HavenClient:
             n_sparks = 8
             for i in range(n_sparks):
                 angle = math.radians(i * 360 / n_sparks)
-                dist  = 4 + 10 * progress   # 4 → 14 px from center
+                dist  = 6 + 15 * progress   # 6 → 21 px from center (fits 44px canvas)
                 sx    = cx + dist * math.cos(angle)
                 sy    = cy + dist * math.sin(angle)
                 alpha = 1.0 - progress       # fade out
@@ -4398,6 +4970,7 @@ class HavenClient:
             ("Clear Saved Password",   self.clear_saved_password),
             ("Change Server",          self.change_server),
             None,
+            ("Check for Updates",     lambda: check_for_updates(self.root, self.theme, silent=False)),
             ("About",                  self.show_about),
         ]
 
@@ -4513,6 +5086,7 @@ class HavenClient:
             self.msg_entry.focus_set()
     def change_name_color(self):
         dialog = ColorPickerDialog(self.root, self.name_color, theme=self.theme)
+        self._track_dialog(dialog)
         self.root.wait_window(dialog)
         if dialog.result and dialog.result != self.name_color:
             old_color = self.name_color; self.name_color = dialog.result
@@ -4596,8 +5170,11 @@ class HavenClient:
 
     def change_server(self):
         """Clear saved password and server, disconnect, and restart to login screen."""
-        if not messagebox.askyesno("Change Server",
-                                   "This will clear your saved password and return you to the login screen.\n\nContinue?"):
+        if not _themed_yesno(self.root, self.theme,
+                             "Change Server", '⚠',
+                             "This will clear your saved password and return you to the login screen.\n\nContinue?",
+                             yes_label="✓  Continue",
+                             no_label="✕  Cancel"):
             return
         # Wipe saved credentials and server
         self.saved_wire_hash = None
