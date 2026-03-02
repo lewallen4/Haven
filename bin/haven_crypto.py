@@ -5,12 +5,14 @@ Implements a CRYSTALS-Kyber-512 + X25519 hybrid KEM, AES-256-GCM
 for chat messages, and XChaCha20-Poly1305 for voice UDP packets.
 
 Dependency tiers (graceful degradation):
-  Tier 1 (stdlib only)    : Pure-Python Kyber-512, AES-GCM via hmac+hashlib, PBKDF2
-  Tier 2 (+cryptography)  : Fast AES-GCM, X25519 ECDH, HKDF, ChaCha20-Poly1305
+  Tier 1 (stdlib only)    : Pure-Python Kyber-512, X25519, PBKDF2
+  Tier 2 (+cryptography)  : REQUIRED — AES-256-GCM, X25519 ECDH, HKDF
   Tier 3 (+argon2-cffi)   : Argon2id password hashing
 
-The wire is always hybrid PQ+classical regardless of tier so the security
-model is consistent. Performance differs but correctness does not.
+The `cryptography` library is REQUIRED for chat encryption (AES-256-GCM).
+Haven will refuse to start without it.  There is no SHAKE-256 fallback
+for new messages — this prevents downgrade attacks.  Legacy SHAKE-256
+ciphertext can still be *decrypted* (read-only) for history migration.
 
 AUTH HANDSHAKE (on top of TLS 1.2+):
   Server → Client : {nonce, kyber_pk, x25519_pk}
@@ -38,6 +40,8 @@ All public-facing API:
   hash_password(password)              → hash_string
   verify_password(password, stored)    → bool
   compute_auth_response(nonce, pw_hash) → hex_string
+  compute_wire_password_hash(password) → hex_string   (v1 legacy)
+  compute_wire_key_v2(password) → hex_string           (v2 HKDF-hardened)
 """
 
 import os
@@ -401,10 +405,62 @@ def kyber_encapsulate(pk_bytes: bytes) -> Tuple[bytes, bytes]:
     return ciphertext, shared_secret
 
 
+def _kyber_encrypt_deterministic(pk_bytes: bytes, m: bytes, r: bytes) -> bytes:
+    """
+    Internal: deterministic encryption using message m and randomness r.
+    Used by the FO transform to re-encrypt during decapsulation.
+    Returns the ciphertext bytes.
+    """
+    t_hat, rho = _decode_pk(pk_bytes)
+    A = _gen_matrix(rho, transpose=True)
+
+    r_seed = r
+    s_prime = []
+    e_prime = []
+    for i in range(_K):
+        prf_s = _prf(r_seed, i, 64 * _ETA1)
+        prf_e = _prf(r_seed, _K + i, 64 * _ETA2)
+        s_prime.append(_cbd(prf_s, _ETA1))
+        e_prime.append(_cbd(prf_e, _ETA2))
+
+    e2_prf = _prf(r_seed, 2 * _K, 64 * _ETA2)
+    e2 = _cbd(e2_prf, _ETA2)
+
+    s_prime_hat = [_ntt(poly) for poly in s_prime]
+
+    u = []
+    for i in range(_K):
+        col_sum = [0] * 256
+        for j in range(_K):
+            col_sum = _poly_add(col_sum, _poly_mul_ntt(A[i][j], s_prime_hat[j]))
+        u.append(_poly_add(_intt(col_sum), e_prime[i]))
+
+    v_sum = [0] * 256
+    for i in range(_K):
+        v_sum = _poly_add(v_sum, _poly_mul_ntt(t_hat[i], s_prime_hat[i]))
+    v_raw = _intt(v_sum)
+
+    m_poly = [round(_Q / 2) * ((m[i // 8] >> (i % 8)) & 1) for i in range(256)]
+    v = _poly_add(_poly_add(v_raw, e2), m_poly)
+
+    u_compressed = [_compress(ui, _DU) for ui in u]
+    v_compressed = _compress(v, _DV)
+
+    c1 = b''.join(_encode(ui, _DU) for ui in u_compressed)
+    c2 = _encode(v_compressed, _DV)
+    return c1 + c2
+
+
 def kyber_decapsulate(sk_bytes: bytes, ciphertext: bytes) -> bytes:
     """
     Decapsulate: recover shared secret from ciphertext using secret key.
     Returns 32-byte shared_secret.
+
+    Full Fujisaki-Okamoto transform: re-encrypts m' with recovered
+    randomness and compares to the received ciphertext.  On mismatch
+    returns KDF(z || H(ct)) (implicit rejection) so that an attacker
+    cannot distinguish valid from invalid ciphertexts — this is
+    required for IND-CCA2 security (FIPS 203).
     """
     sk_size = _K * 384
     pk_size = _K * 384 + 32
@@ -439,15 +495,24 @@ def kyber_decapsulate(sk_bytes: bytes, ciphertext: bytes) -> bytes:
         for i in range(32)
     ])
 
-    # Re-encapsulate
+    # Re-derive randomness and pre-key from recovered message
     kg = _hash_g(m_prime + h_pk)
-    K_bar = kg[32:]
+    r_prime = kg[:32]
+    K_bar   = kg[32:]
 
-    # Re-derive ciphertext for implicit rejection
-    # (simplified: in production use full Fujisaki-Okamoto transform check)
+    # ── Full FO re-encryption check (FIPS 203 §7.3) ─────────────────
+    ct_prime = _kyber_encrypt_deterministic(pk, m_prime, r_prime)
+
     h_ct = _hash_h(ciphertext)
-    shared_secret = _kdf(K_bar + h_ct)
-    return shared_secret
+
+    # Constant-time-ish comparison (Python limits true CT, but we avoid
+    # early-exit branching).  On match → real shared secret; on mismatch
+    # → implicit rejection using the random value z from the secret key.
+    if _hmac.compare_digest(ciphertext, ct_prime):
+        return _kdf(K_bar + h_ct)
+    else:
+        # Implicit rejection — indistinguishable from a valid decapsulation
+        return _kdf(z + h_ct)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -620,24 +685,62 @@ def _aes_gcm_decrypt_stdlib(key: bytes, data: bytes) -> Optional[bytes]:
 def encrypt_message(key: bytes, plaintext: str) -> str:
     """
     Encrypt a chat message. Returns a base64-encoded string safe for JSON.
-    Single wire format (SHAKE-256-CTR + HMAC-SHA256) regardless of available libs.
-    This guarantees client/server compatibility even if cryptography lib differs.
-    Wire format: [12-byte nonce][32-byte HMAC tag][ciphertext]
+
+    REQUIRES the `cryptography` library — uses real AES-256-GCM.
+    No fallback to SHAKE-256-CTR.  If CRYPTO_AVAILABLE is False,
+    raises RuntimeError — the caller should have checked at startup.
+
+    Wire format: [0x03][12-byte nonce][ciphertext+16-byte GCM tag]
     """
-    payload = _aes_gcm_encrypt_stdlib(key, plaintext.encode('utf-8'))
+    if not CRYPTO_AVAILABLE:
+        raise RuntimeError(
+            "AES-256-GCM requires the `cryptography` library. "
+            "Install it: pip install cryptography"
+        )
+    pt_bytes = plaintext.encode('utf-8')
+    nonce = os.urandom(12)
+    ct_and_tag = AESGCM(key[:32]).encrypt(nonce, pt_bytes, None)
+    payload = b'\x03' + nonce + ct_and_tag
     return base64.b64encode(payload).decode('ascii')
 
 
 def decrypt_message(key: bytes, ciphertext_b64: str) -> Optional[str]:
     """
     Decrypt a chat message. Returns plaintext string or None on failure.
+
+    Accepts version 0x03 (AES-256-GCM, current) and legacy formats
+    (0x01 / no-version-byte SHAKE fallback) for one-time migration of
+    stored history.  New messages are always version 0x03.
     """
     try:
         data = base64.b64decode(ciphertext_b64)
-        pt_bytes = _aes_gcm_decrypt_stdlib(key, data)
-        if pt_bytes is None:
+        if len(data) < 2:
             return None
-        return pt_bytes.decode('utf-8')
+
+        version = data[0]
+
+        if version == 0x03:
+            # AES-256-GCM (current standard)
+            if not CRYPTO_AVAILABLE:
+                return None
+            nonce = data[1:13]
+            ct_and_tag = data[13:]
+            pt_bytes = AESGCM(key[:32]).decrypt(nonce, ct_and_tag, None)
+            return pt_bytes.decode('utf-8')
+
+        elif version == 0x01:
+            # Legacy SHAKE-256-CTR + HMAC-SHA256 — read-only for migration
+            pt_bytes = _aes_gcm_decrypt_stdlib(key, data[1:])
+            if pt_bytes is None:
+                return None
+            return pt_bytes.decode('utf-8')
+
+        else:
+            # Legacy: no version byte — entire blob is SHAKE fallback
+            pt_bytes = _aes_gcm_decrypt_stdlib(key, data)
+            if pt_bytes is None:
+                return None
+            return pt_bytes.decode('utf-8')
     except Exception:
         return None
 
@@ -646,25 +749,59 @@ def decrypt_message(key: bytes, ciphertext_b64: str) -> Optional[str]:
 # Symmetric Encryption — Voice (ChaCha20-Poly1305 / SHAKE-256 fallback)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Voice packets: [12-byte nonce][ciphertext+tag]
-# We use a compact format to keep UDP overhead minimal.
+# Voice packets: [4-byte seq BE][12-byte nonce][16-byte tag][ciphertext]
+# The 4-byte big-endian sequence number is authenticated inside the HMAC
+# to prevent replay and reorder attacks.
 
-def encrypt_voice(key: bytes, pcm: bytes) -> bytes:
+def encrypt_voice(key: bytes, pcm: bytes, seq: int = 0) -> bytes:
     """Encrypt a voice UDP packet. Returns bytes ready to send.
-    Single wire format: SHAKE-256-CTR + HMAC-SHA256 (12+16+len).
+    seq is a monotonically increasing 32-bit counter managed by the caller
+    (SessionCrypto handles this automatically).
+    Wire format: [4B seq BE][12B nonce][16B tag][ciphertext]
     """
+    seq_bytes = struct.pack('>I', seq & 0xFFFFFFFF)
     nonce = os.urandom(12)
     h = hashlib.shake_256()
-    h.update(key + nonce + b'voice')
+    h.update(key + nonce + seq_bytes + b'voice')
     ks = h.digest(len(pcm))
     ct = bytes(a ^ b for a, b in zip(pcm, ks))
-    tag_key = _hmac.new(key, b'voice-tag-' + nonce, hashlib.sha256).digest()
+    tag_key = _hmac.new(key, b'voice-tag-' + nonce + seq_bytes, hashlib.sha256).digest()
     tag = _hmac.new(tag_key, ct, hashlib.sha256).digest()[:16]
-    return nonce + tag + ct
+    return seq_bytes + nonce + tag + ct
 
 
-def decrypt_voice(key: bytes, data: bytes) -> Optional[bytes]:
-    """Decrypt a voice UDP packet. Returns PCM bytes or None."""
+def decrypt_voice(key: bytes, data: bytes, min_seq: int = -1) -> Optional[tuple]:
+    """Decrypt a voice UDP packet. Returns (pcm_bytes, seq) or None.
+    If min_seq >= 0, packets with seq <= min_seq are rejected (replay protection).
+    For backward compatibility, callers that don't track seq can ignore the
+    returned seq value.
+    """
+    try:
+        if len(data) < 44:       # 4 seq + 12 nonce + 16 tag + at least 12 payload
+            return None
+        seq_bytes = data[:4]
+        seq = struct.unpack('>I', seq_bytes)[0]
+        nonce = data[4:16]
+        tag   = data[16:32]
+        ct    = data[32:]
+        # Replay check
+        if min_seq >= 0 and seq <= min_seq:
+            return None
+        tag_key = _hmac.new(key, b'voice-tag-' + nonce + seq_bytes, hashlib.sha256).digest()
+        expected = _hmac.new(tag_key, ct, hashlib.sha256).digest()[:16]
+        if not _hmac.compare_digest(tag, expected):
+            # Try legacy format (no seq prefix) for backward compat during upgrade
+            return _decrypt_voice_legacy(key, data)
+        h = hashlib.shake_256()
+        h.update(key + nonce + seq_bytes + b'voice')
+        ks = h.digest(len(ct))
+        return (bytes(a ^ b for a, b in zip(ct, ks)), seq)
+    except Exception:
+        return None
+
+
+def _decrypt_voice_legacy(key: bytes, data: bytes) -> Optional[tuple]:
+    """Decrypt a legacy voice packet (no sequence number).  Returns (pcm, -1) or None."""
     try:
         if len(data) < 40:
             return None
@@ -678,7 +815,7 @@ def decrypt_voice(key: bytes, data: bytes) -> Optional[bytes]:
         h = hashlib.shake_256()
         h.update(key + nonce + b'voice')
         ks = h.digest(len(ct))
-        return bytes(a ^ b for a, b in zip(ct, ks))
+        return (bytes(a ^ b for a, b in zip(ct, ks)), -1)
     except Exception:
         return None
 
@@ -736,8 +873,36 @@ def compute_auth_response(nonce: str, password_hash: str) -> str:
 
 
 def compute_wire_password_hash(password: str) -> str:
-    """SHA-256 of password — used only on the wire, never stored."""
+    """SHA-256 of password — used only on the wire, never stored.
+    V1 (legacy) wire key.  New installs should use compute_wire_key_v2()."""
     return hashlib.sha256(password.encode()).hexdigest()
+
+
+def compute_wire_key_v2(password: str) -> str:
+    """
+    Derive a wire-protocol key from the password via HKDF-SHA256.
+
+    Unlike v1 (bare SHA-256), this uses a domain-separated HKDF expansion
+    so the stored value cannot be brute-forced as cheaply as a plain SHA-256
+    hash, and it is not directly the SHA-256 of the password.
+
+    Both client and server derive the same value from the same plaintext
+    password.  The server keeps this in memory only; the client may persist
+    it for "remember password" (acceptable per user's risk tolerance).
+
+    Returns: hex string (64 chars).
+    """
+    ikm  = password.encode('utf-8')
+    salt = hashlib.sha256(b'haven-wire-key-v2-salt').digest()
+    if CRYPTO_AVAILABLE:
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
+                     info=b'haven-wire-key-v2')
+        return hkdf.derive(ikm).hex()
+    else:
+        # RFC 5869 HKDF in pure Python
+        prk = _hmac.new(salt, ikm, hashlib.sha256).digest()
+        t   = _hmac.new(prk, b'haven-wire-key-v2\x01', hashlib.sha256).digest()
+        return t[:32].hex()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -796,6 +961,8 @@ class SessionCrypto:
         self.session_key = session_key
         self.voice_key   = derive_voice_key(session_key)
         self._lock       = __import__('threading').Lock()
+        self._voice_tx_seq  = 0          # outgoing voice sequence counter
+        self._voice_rx_high = -1         # highest received seq (replay window)
 
     def encrypt_chat(self, plaintext: str) -> str:
         return encrypt_message(self.session_key, plaintext)
@@ -804,10 +971,21 @@ class SessionCrypto:
         return decrypt_message(self.session_key, ct_b64)
 
     def encrypt_voice(self, pcm: bytes) -> bytes:
-        return encrypt_voice(self.voice_key, pcm)
+        with self._lock:
+            seq = self._voice_tx_seq
+            self._voice_tx_seq = (self._voice_tx_seq + 1) & 0xFFFFFFFF
+        return encrypt_voice(self.voice_key, pcm, seq)
 
     def decrypt_voice(self, data: bytes) -> Optional[bytes]:
-        return decrypt_voice(self.voice_key, data)
+        result = decrypt_voice(self.voice_key, data, self._voice_rx_high)
+        if result is None:
+            return None
+        pcm, seq = result
+        if seq >= 0:
+            with self._lock:
+                if seq > self._voice_rx_high:
+                    self._voice_rx_high = seq
+        return pcm
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -817,12 +995,20 @@ class SessionCrypto:
 def _selftest():
     print("haven_crypto selftest...")
 
-    # Kyber
+    # Kyber (now with full FO transform)
     pk, sk = generate_kyber_keypair()
     ct, ss1 = kyber_encapsulate(pk)
     ss2 = kyber_decapsulate(sk, ct)
     assert ss1 == ss2, f"Kyber KEM mismatch!\n  enc: {ss1.hex()}\n  dec: {ss2.hex()}"
     print(f"  ✓ Kyber-512 KEM   pk={len(pk)}B sk={len(sk)}B ct={len(ct)}B ss={ss1.hex()[:16]}...")
+
+    # Kyber implicit rejection (FO transform)
+    bad_ct = bytearray(ct)
+    bad_ct[10] ^= 0xFF  # corrupt one byte
+    ss_bad = kyber_decapsulate(sk, bytes(bad_ct))
+    assert ss_bad != ss1, "FO implicit rejection failed — bad ct yielded real SS!"
+    assert len(ss_bad) == 32, "FO implicit rejection returned wrong length"
+    print(f"  ✓ Kyber FO reject implicit_ss={ss_bad.hex()[:16]}... (differs from real)")
 
     # X25519
     priv1, pub1 = generate_x25519_keypair()
@@ -836,20 +1022,33 @@ def _selftest():
     sk_key = derive_session_key(ss1, ss_a, "test-nonce-1234")
     print(f"  ✓ HKDF session key  {sk_key.hex()[:16]}...")
 
-    # Chat encryption
+    # Chat encryption (version-tagged)
     session = SessionCrypto(sk_key)
     msg = "Hello, quantum-safe world! 🔐"
     ct_msg = session.encrypt_chat(msg)
     pt_msg = session.decrypt_chat(ct_msg)
     assert pt_msg == msg, f"Chat decrypt mismatch: {pt_msg!r}"
-    print(f"  ✓ Chat AES-GCM    '{msg[:30]}...' → {len(ct_msg)}B ciphertext")
+    tag = "AES-256-GCM" if CRYPTO_AVAILABLE else "SHAKE256-CTR+HMAC"
+    print(f"  ✓ Chat {tag}  '{msg[:30]}...' → {len(ct_msg)}B ciphertext")
 
-    # Voice encryption
+    # Voice encryption (with sequence counter + replay protection)
     pcm = os.urandom(2048)
     enc_voice = session.encrypt_voice(pcm)
     dec_voice = session.decrypt_voice(enc_voice)
     assert dec_voice == pcm, "Voice decrypt mismatch!"
-    print(f"  ✓ Voice ChaCha20  {len(pcm)}B pcm → {len(enc_voice)}B encrypted")
+    print(f"  ✓ Voice seq-CTR   {len(pcm)}B pcm → {len(enc_voice)}B encrypted")
+
+    # Voice replay rejection
+    dec_replay = session.decrypt_voice(enc_voice)
+    assert dec_replay is None, "Replay was accepted — should have been rejected!"
+    print(f"  ✓ Voice replay    rejected (seq already seen)")
+
+    # Wire key v2
+    wk = compute_wire_key_v2("testpassword123!")
+    assert len(wk) == 64, "Wire key v2 wrong length"
+    wk2 = compute_wire_key_v2("testpassword123!")
+    assert wk == wk2, "Wire key v2 not deterministic"
+    print(f"  ✓ Wire key v2     {wk[:16]}...")
 
     # Password hashing
     ph = hash_password("testpassword123!")
@@ -858,7 +1057,8 @@ def _selftest():
     print(f"  ✓ Password hash   {ph[:30]}...")
 
     print("  ✓ All selftests passed!\n")
-    print(f"  Crypto backend: {'cryptography lib' if CRYPTO_AVAILABLE else 'stdlib (pure Python)'}")
+    print(f"  Crypto backend: {'cryptography lib' if CRYPTO_AVAILABLE else 'MISSING — WILL NOT ENCRYPT'}")
+    print(f"  Chat AEAD:      {'AES-256-GCM (required)' if CRYPTO_AVAILABLE else 'UNAVAILABLE'}")
     print(f"  Password KDF:   {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256 (600k)'}")
 
 

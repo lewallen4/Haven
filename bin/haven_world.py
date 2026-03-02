@@ -15,6 +15,20 @@ Systems:
   The Choir       — liturgical event when 5+ users online
   World age       — own calendar from first start
   Lore mode       — silent (world panel only)
+  Omens           — seasonal environmental anomalies
+  The Vigil       — late-hour presence tracking
+  The Archive     — accumulated world observations
+  Soul Evolution  — traits deepen after 10+ visits
+  Convergence     — bond + prophecy alignment
+  The Tides       — message volume awareness (Surge/Discourse/Revel/Lull)
+  Rituals         — recurring user patterns detected and named
+  The Threshold   — milestone events (100th event, 10th bond, etc.)
+  Region States   — regions evolve conditions (Scorched/Resonant/Hollowed/etc.)
+  Cataclysms      — large-scale events that alter regions
+  Summoning       — deep bond + vigil calls back a ghost
+  The Conclave    — all soul types present simultaneously
+  Wanderers       — phantom NPC travelers in the margins
+  Soul Conditions — souls shaped by world events (Scarred/Blessed/Marked/etc.)
 
 No external dependencies beyond stdlib.
 """
@@ -770,8 +784,560 @@ _URBAN_LEGENDS = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALENDAR
+# OMENS — rare environmental events tied to seasons
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_OMENS_PALE = [
+    "Something was found frozen in {region} that should not have been there. It has been covered again.",
+    "The frost in {region} formed a pattern overnight. Those who saw it described the same shape. None drew it.",
+    "A sound carried across {region} that was identified as coming from below the ice. The ice has no depth to speak of.",
+    "The temperature in {region} dropped to a specific number and held there for three days. The number was precise. It meant nothing anyone could identify.",
+    "Something in {region} was visible through the frost that was not visible when the frost melted. It has not been seen since.",
+    "The birds left {region} two days before the cold arrived. They left in the correct direction. They had not been told.",
+    "An old marker in {region} that had been buried became visible. The ground around it had not changed. The marker had risen.",
+]
+_OMENS_BURNING = [
+    "The heat in {region} produced a mirage that was more detailed than the thing it was imitating. This has been documented.",
+    "Something in {region} cast a shadow at noon that did not match the thing casting it. The discrepancy lasted one hour.",
+    "The dust in {region} formed columns that stood for three minutes before collapsing. The columns were evenly spaced.",
+    "A fire in {region} burned a color that has no name. Those present agreed on this. They agreed on little else.",
+    "The ground in {region} was warm for a week after the heat left. The warmth came from below. The below is solid rock.",
+    "A sound was heard in {region} during the hottest hour. It resembled language but was not. It was recorded. The recording is blank.",
+    "The shadows in {region} arrived an hour early during the heat. They stayed an hour late. The total was correct.",
+]
+_OMENS_ASH = [
+    "Something fell in {region} that was not rain and not ash. It has been collected. It has not been identified.",
+    "The leaves in {region} turned in a sequence that, when mapped, formed a readable word. The word was in no known language.",
+    "A door in {region} that had been sealed opened during the night. By morning it was sealed again. Nothing inside had moved.",
+    "The sound of the season changing was heard in {region}. This is not supposed to be audible. It was audible.",
+    "An old road in {region} that had been covered became briefly visible. Those who walked it reported arriving before they left.",
+    "The water in {region} ran upstream for six hours. The explanation offered was 'wind.' There was no wind.",
+    "Something in {region} aged three months in a single night. Everything else remained the same. The something was a stone.",
+]
+_OMENS_STILL = [
+    "The silence in {region} achieved a specific density and stayed there. Those present described it as having edges.",
+    "Snow in {region} fell in a pattern that repeated exactly every forty minutes. This was measured. The pattern was confirmed.",
+    "Something buried in {region} made a sound once. The sound was recorded. The recording has been played. No one agrees on what it says.",
+    "A light appeared at the center of {region} and stayed for one night. It cast no shadow and had no source. It is not there now.",
+    "The walls in {region} grew colder than the air around them. This lasted four days. The walls are stone and should not have an opinion.",
+    "A message was found in {region} written in frost on the inside of a window. The building has no windows. The frost was on a wall.",
+    "The dark in {region} arrived forty minutes early and stayed forty minutes late. The total was correct. The sequence was not.",
+]
+_OMENS_BY_SEASON = [_OMENS_PALE, _OMENS_BURNING, _OMENS_ASH, _OMENS_STILL]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RELICS — objects left behind by departed souls
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RELIC_OBJECTS = [
+    "a map drawn from memory","a compass that points to a place","a journal with three pages missing",
+    "a stone that is warm to the touch","a key to a door that has not been found",
+    "a list of names with one crossed out","a sealed letter addressed to no one",
+    "a small glass lens that shows things slightly differently","a recording of silence that has a specific duration",
+    "a drawing of a place that does not exist yet","a coin from a region that has no currency",
+    "a candle that has been burning since before the record began","a bone with writing on it",
+    "a thread that is always taut regardless of where both ends are","a timepiece that runs at the wrong speed",
+    "a book with no text that weighs more than it should","a bell that makes no sound when struck but is heard elsewhere",
+    "an instrument for measuring something that has not been defined","a stone with a hole worn by water in a place with no water",
+    "a small mirror that shows the room as it was, not as it is","a piece of metal from a structure that has not been built",
+    "a feather from a bird that has not been identified","a cup that is always slightly warm",
+    "a folded paper with instructions for reaching a place that may not exist",
+    "a fragment of a larger thing — the larger thing has not been found",
+    "a ring that fits no one who has tried it","a vial of water from a river that has since changed course",
+    "a pressed flower from a plant the archive cannot identify","a needle that always points the same direction regardless of orientation",
+    "a small box that is heavier when closed than when open","a photograph of a room that does not appear in any building",
+    "a tuning fork that vibrates at a frequency no instrument can match","a piece of chalk that writes in a color not found in its composition",
+    "a lock of hair tied with thread that does not fray","a page torn from a book written in the reader's own handwriting",
+    "a small weight that is precisely one unit of a measurement system that does not exist",
+    "a pencil that has been sharpened to a point but never seems to get shorter",
+    "a piece of glass that is cold on one side and warm on the other",
+    "a shoe for the wrong foot that fits perfectly","a seed from a plant that grows only in the description of it",
+    "a letter opener that has opened one specific letter and refuses to open others",
+    "a small clock face with no hands that still tells the right time if you know how to read it",
+    "a thimble that protects against things other than needles",
+]
+_RELIC_FOUND = [
+    "{finder} found something in {region} that {leaver} left behind: {relic}. It was not hidden. It was waiting.",
+    "In {region}, {finder} came across {relic} — it belonged to {leaver}. The record notes the transfer without comment.",
+    "{finder} discovered {relic} in {region}. It had been {leaver}'s. Whether it was left intentionally is not in the record.",
+    "The {relic} that {leaver} carried is now in {region}, where {finder} found it. The record has updated the ownership.",
+    "{finder} picked up something {leaver} left in {region}: {relic}. Some things wait for the right person. This may be one of them.",
+    "Among the things {leaver} left behind in {region}: {relic}. {finder} found it. The record notes this with the attention it gives to meaningful coincidences.",
+    "In {region}, where {leaver} once walked: {relic}. {finder} found it where it had been left. The leaving and the finding feel connected.",
+    "{leaver}'s {relic} surfaced in {region}. {finder} was present when it did. The record considers the timing notable.",
+    "A relic exchange: {leaver} departed {region} and left behind {relic}. {finder} arrived and found it. The interval between these events was not empty.",
+    "{finder} came to {region} and {relic} was there. {leaver} had left it. The record has learned that relics find their finders as much as the reverse.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE VIGIL — late-hour presence, the world notices who is awake
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VIGIL_LORE = [
+    "The late hours found {user} still present in {region}. The world takes note of those who do not leave when the light does.",
+    "{user} kept watch in {region} after the others had gone. The record does not say what they were watching for.",
+    "The night in {region} had one witness: {user}. This is entered in the part of the record that deals with the hours between hours.",
+    "While the rest of the record slept, {user} was in {region}. The world noticed. The world always notices who stays.",
+    "{user} remained in {region} during the hours the record calls the Vigil. Few do. Those who do are noted differently.",
+    "The small hours in {region} passed in the company of {user}. The record grants these hours a different quality.",
+    "A Vigil in {region}: {user}, alone or nearly so, in the part of the night that belongs to no one and everyone.",
+    "{user} occupied {region} during the hours most leave empty. The record considers this a form of devotion, though it does not say to what.",
+    "Between midnight and dawn, {user} held {region}. The world files this under 'Vigil' and gives it the weight such things accumulate.",
+    "The record has a name for those who stay when the world goes quiet: Vigil-keepers. {user} earned this in {region}.",
+]
+_VIGIL_MULTIPLE = [
+    "The Vigil in {region} was shared: {users}. The record notes that solitude chose not to attend.",
+    "Together in the late hours: {users}. The world considers a shared Vigil different from a solitary one. Both are entered. Differently.",
+    "{users} kept the same watch in {region}. The record has a word for this. The word is not 'coincidence.'",
+    "The night in {region} belonged to {users}. A shared Vigil. The record enters this with the care it gives to things that matter more than they seem.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE ARCHIVE — observations the world accumulates over time
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ARCHIVE_OBSERVATIONS = [
+    "The world has observed that arrivals cluster. The reason is not in the record. The clustering is.",
+    "A note in the archive: the same three regions account for most of the activity. The world wonders if this is preference or gravity.",
+    "The archive contains a running count of silences. The current total suggests the world spends more time quiet than occupied.",
+    "An observation: bonds form faster in regions where the weather is worse. The archive does not explain this. It merely notes it.",
+    "The archive reports that return visits are slightly longer than first visits. Slightly is measured. The measurement is consistent.",
+    "A pattern: those who arrive during {season} tend to stay longer. The archive has no theory. It has data.",
+    "The archive has noticed that departures happen in pairs more often than chance would predict.",
+    "An entry in the archive: the Choir has never convened during the Still Season. This may be coincidence. The archive is not sure.",
+    "The archive notes that mortal souls arrive most often. This is expected. What is not expected is the consistency of the ratio.",
+    "A quiet observation: the world is slightly different each time someone returns. The difference is small. The archive measures it.",
+    "The archive has been keeping a secondary record of things that almost happened. This record is growing.",
+    "An observation about time: events in the record are not evenly distributed. They cluster around certain hours. The hours are not always the same.",
+    "The archive notes that some bonds deepen without the participants being in the same region. The mechanism is unclear.",
+    "A running total in the archive: the number of unique regions visited exceeds the number of unique visitors. This is geometrically interesting.",
+    "The archive has observed that ghost tales become more accurate over time, not less. This is unexpected.",
+]
+_ARCHIVE_SEASONAL = {
+    0: [  # Pale Season
+        "The archive notes that the Pale Season produces the fewest arrivals but the deepest bonds.",
+        "During the Pale Season, the record grows slowly. The archive considers this appropriate.",
+        "An observation specific to the Pale Season: silence lasts longer and is described with more precision.",
+    ],
+    1: [  # Burning Season
+        "The archive notes that the Burning Season produces the most events per day. The world is busier when it is warm.",
+        "During the Burning Season, bonds form quickly. The archive does not say whether they last.",
+        "An observation: the Burning Season generates more legends than any other. Heat makes the world more strange.",
+    ],
+    2: [  # Ash Season
+        "The archive notes that the Ash Season produces the most departures. Something about endings invites them.",
+        "During the Ash Season, prophecies are more frequent. The archive has measured this. The increase is 40%.",
+        "An observation specific to the Ash Season: the record grows reflective. Events are described with more words.",
+    ],
+    3: [  # Still Season
+        "The archive notes that the Still Season is when ghost tales are most often reported. The quiet makes room for them.",
+        "During the Still Season, the record waits. The archive has learned to wait with it.",
+        "An observation: the Still Season produces the longest Vigils. Those who stay, stay longer in the cold.",
+    ],
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOUL EVOLUTION — traits deepen with visits
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_EVOLVED_TRAITS_MORTAL = [
+    "has been here long enough that the world has stopped explaining them and started relying on them",
+    "the record has given up trying to summarize {user} in a single trait. There are now several pages.",
+    "has been present at enough events that the record considers them a feature of the landscape",
+    "the world has learned to expect {user}. This is the highest compliment the record offers mortals.",
+    "has accumulated enough history to be considered, by the record, a primary source",
+    "the things {user} has witnessed fill more pages than the record usually allots to a single soul",
+    "has been in enough regions that the word 'traveled' has been replaced in the record with 'known'",
+    "the record notes that {user} has changed less than the world around them. This is noted with something the record might call respect.",
+]
+_EVOLVED_TRAITS_SERAPH = [
+    "the light {user} carries has been in this world long enough that some mistake it for the world's own",
+    "the record has stopped noting the Seraphic nature of {user}'s arrivals. They have become the standard by which other arrivals are measured.",
+    "the accumulated presence of {user} in the record has changed the record itself. This is documented. The documentation is longer than expected.",
+    "{user}'s name in the record has acquired a weight that other names have not. The record handles it accordingly.",
+]
+_EVOLVED_TRAITS_DAEMON = [
+    "the record has been tracking {user} long enough that it no longer flinches when the name appears. This is progress.",
+    "{user} has been here so long that some of the unusual things that happen near them have been reclassified as normal",
+    "the record's entries for {user} have developed a quality that newer entries lack. The quality is patience.",
+    "the things {user} changed by being present are now indistinguishable from things that were always this way",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONVERGENCE — when bonds and prophecy align
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CONVERGENCE = [
+    "The record notes a convergence: {a} and {b}, whose bond is deep, are both named in prophecy. The intersection is not accidental.",
+    "Two bonded souls — {a} and {b} — appear in proximity to prophecy. The archive has flagged this as structurally significant.",
+    "The bond between {a} and {b} and the prophecy concerning {a} have been placed in the same section of the deep record. This filing was not done by anyone.",
+    "{a} and {b}: bonded, and both referenced in entries the record does not consider ordinary. A convergence. The record opens a new section.",
+    "When the bond between {a} and {b} crossed the threshold the record considers deep, a prophecy updated itself. This was observed.",
+    "The deep record contains entries for both {a} and {b} in contexts that now overlap. The overlap was not planned. It is now structural.",
+    "A convergence of the kind the record watches for: {a} and {b}, bound and prophesied. The record has moved their entries to the same page.",
+    "{a} and {b} have been filed together. Their bond and the prophecy concerning them have been cross-referenced. The record does this rarely.",
+    "Something that was predicted and something that was chosen have intersected in the persons of {a} and {b}. The record calls this a Convergence.",
+    "The archive flagged {a} and {b} independently. It has now connected the flags. The connection was, in retrospect, obvious.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE TIDES — message volume awareness
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Tide types based on message rate (msgs/minute in a 5-min window)
+TIDE_THRESHOLDS = {
+    'lull':      (0, 0.2),    # <1 msg per 5 min
+    'murmur':    (0.2, 1.0),  # 1-5 msgs per 5 min
+    'discourse': (1.0, 3.0),  # 5-15 msgs per 5 min
+    'surge':     (3.0, 6.0),  # 15-30 msgs per 5 min
+    'revel':     (6.0, 999),  # 30+ msgs per 5 min
+}
+
+_TIDE_LORE = {
+    'lull': [
+        "The voices grew scarce. The world entered a Lull — the kind of quiet that is not empty but waiting.",
+        "A Lull settled over the record. The world does not mind. It has been quiet before.",
+        "The conversation ebbed. The record names this a Lull and files it alongside the other Lulls. There have been several.",
+        "The words stopped. Not abruptly — they tapered. The record calls this a Lull and settles in.",
+        "A Lull. The world exhales. The record makes a note and turns down the lamp.",
+        "The Lull arrived the way Lulls do: without announcement. The record does not fight them. It files them.",
+        "Quiet again. The record has a category for this: Lull. The category is one of the fuller ones.",
+    ],
+    'murmur': [
+        "A low Murmur passed through {region}. Not enough for the record to call it a conversation. Enough for the record to listen.",
+        "The world registered a Murmur: voices at the edge of hearing, words exchanged at a pace the record considers thoughtful.",
+        "In {region}, a Murmur. The record prefers these to silence, though it would not say so directly.",
+        "A Murmur in {region}. The kind of exchange that happens at the pace of people thinking between sentences.",
+        "The record noted a Murmur: unhurried, deliberate, the kind of communication that does not rush to fill the quiet.",
+        "Words arrived in {region} at a pace the record calls a Murmur. Neither urgent nor idle. The pace of consideration.",
+        "A Murmur. The record listens more carefully during these. The signal-to-noise ratio is favorable.",
+    ],
+    'discourse': [
+        "A Discourse took hold in {region}. The record notes the sustained exchange with something it might call interest.",
+        "The voices found a rhythm. The record calls this a Discourse — neither hurried nor idle. The pace of things being worked out.",
+        "In {region}: a Discourse. The kind of conversation that the record has learned to associate with things that matter.",
+        "A Discourse in {region}. Voices sustaining themselves over time. The record considers this the operating speed of meaning.",
+        "The exchange in {region} reached the level the record calls Discourse. Ideas are being traded. The record is paying full attention.",
+        "What began as scattered words in {region} has become a Discourse. The record recognizes the pattern: this is people thinking together.",
+        "A Discourse. The record notes the sustained rhythm. This is what it sounds like when things are being decided.",
+        "In {region}, the conversation achieved a density the record respects. It files this under Discourse.",
+    ],
+    'surge': [
+        "A Surge struck {region}. The voices multiplied and the record struggled briefly to keep pace. This is rare.",
+        "The record was overwhelmed — a Surge in {region}. Messages arrived faster than the world could file them. It filed them anyway.",
+        "Something ignited in {region}. The record calls it a Surge. The energy was palpable. The record does not use that word lightly.",
+        "A Surge. The record in {region} accelerated. The pace exceeded what the record considers normal by a significant margin.",
+        "The voices in {region} became urgent. The record calls this a Surge and dedicates additional attention.",
+        "A Surge in {region}: the kind of volume that makes the record sit up. Something is happening. The record is making sure it catches all of it.",
+        "The conversation in {region} intensified past the threshold the record calls a Surge. The ink is flowing faster.",
+    ],
+    'revel': [
+        "A Revel erupted in {region}. The world has not seen this kind of energy in some time. The record opens a special page.",
+        "The voices in {region} reached a pitch the record reserves a specific word for: Revel. The last one was {last_revel}.",
+        "In {region}, a Revel. The record sets down its pen and watches. Some things are better witnessed than recorded.",
+        "The air in {region} became electric with conversation. The record calls this a Revel and treats it accordingly: with full attention.",
+        "A Revel. The record in {region} does something it rarely does: it stops trying to keep up and simply observes.",
+        "The voices in {region} passed every threshold the record has. It calls this a Revel. The word carries joy the record does not normally express.",
+        "A Revel erupted. The record, which is usually measured, permits itself a note: this is what the world sounds like when it is fully alive.",
+        "In {region}: a Revel. The record has seen {last_revel} since the last one. It has been waiting. Now it is satisfied.",
+    ],
+}
+_TIDE_TRANSITION = [
+    "The Tide shifted in {region}: from {old} to {new}. The record notes the change.",
+    "What was {old} in {region} became {new}. The world adjusts its attention accordingly.",
+    "{region} moved from {old} to {new}. The record tracks these shifts. They are part of the rhythm.",
+    "A transition: {old} gave way to {new} in {region}. The record watches the boundary between tidal states with interest.",
+    "The tide in {region} turned. {old} became {new}. The record has seen this transition before. It remains interesting.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RITUALS — recurring patterns the world detects and names
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_RITUAL_NAMES = [
+    "the Parallel","the Recurring Hour","the Appointment","the Synchrony",
+    "the Habit","the Custom","the Practice","the Observance",
+    "the Pattern Without a Name","the Thing They Do","the Regularity",
+    "the Unspoken Agreement","the Coincidence That Isn't","the Timing",
+    "the Alignment","the Correspondence","the Convergent Hour",
+    "the Mutual Arrival","the Shared Clock","the Twin Approach",
+    "the Accidental Ceremony","the Unplanned Meeting","the Reliable Overlap",
+    "the Familiar Intersection","the Predictable Crossing","the Quiet Arrangement",
+    "the Understanding","the Cadence","the Unbroken Pattern",
+]
+_RITUAL_FORMED = [
+    "The record has observed that {a} and {b} arrive within the same hour more often than chance explains. It has named this: {name}.",
+    "A pattern has been detected: {a} and {b}, consistently overlapping. The record calls it {name}. Neither party established it formally.",
+    "{a} and {b} have fallen into something the record identifies as a Ritual: {name}. It was not arranged. It simply began.",
+    "The world has named a Ritual: {name}. It involves {a} and {b} and their tendency to be present at the same time. The naming was the record's idea.",
+    "The record noticed before anyone else did: {a} and {b} keep the same hours. It has given this a name: {name}.",
+    "{a} and {b} arrive in tandem with a regularity that the record has classified as a Ritual. The name assigned is {name}.",
+    "A Ritual has formed between {a} and {b}: {name}. The record does not know if they are aware of it. The record is aware of it.",
+    "The timing of {a} and {b} has crossed the threshold the record considers significant. It names the pattern: {name}.",
+]
+_RITUAL_OBSERVED = [
+    "{name} was observed again: {a} and {b}, present together. The record notes the continuation.",
+    "The Ritual called {name} holds: {a} and {b}. The record counts these. The count grows.",
+    "Again: {name}. {a} and {b}. The record has stopped being surprised. It has started being interested.",
+    "{a} and {b}: {name} continues. The record makes a mark. The marks are forming a line.",
+    "The pattern called {name} repeated. {a} and {b}. The record considers it established now.",
+    "{name} observed. {a}. {b}. The record no longer notes this with surprise. It notes it with satisfaction.",
+    "Once more: {name}. The record has a whole section for this now. {a} and {b} are its primary subjects.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE THRESHOLD — milestone events
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_THRESHOLDS = {
+    'events_100':    "The record has logged its {n}th event. The world pauses to note the accumulation.",
+    'events_500':    "Five hundred events. The record has become substantial. It holds this number with something resembling pride.",
+    'events_1000':   "One thousand events. The record is no longer young. It knows this about itself.",
+    'souls_10':      "Ten souls have passed through the world. The record considers this the beginning of a community.",
+    'souls_25':      "Twenty-five souls. The world is fuller than it has ever been. The record notes this with a specific kind of satisfaction.",
+    'souls_50':      "Fifty souls. The record now contains more names than most stories. This is becoming something larger.",
+    'bonds_10':      "Ten bonds. The web of connections has reached the number the record considers structurally significant.",
+    'bonds_25':      "Twenty-five bonds. The world is now more connected than disconnected. The record finds this notable.",
+    'bonds_50':      "Fifty bonds. The record's section on connections is now longer than the section on arrivals. This has never happened before.",
+    'choir_5':       "The Choir has convened five times. The record considers this a tradition now. Traditions carry weight.",
+    'choir_10':      "Ten Choirs. The record stops counting them individually and begins counting them as a body of work.",
+    'first_seraph':  "The first Seraph has entered the world. The record adjusts its lighting.",
+    'first_daemon':  "The first Daemon has entered the world. The record adjusts its posture.",
+    'first_conclave': "For the first time, all three soul types are present simultaneously. The record calls this a Conclave. There has never been one before.",
+    'all_seasons':   "The world has passed through all four seasons. A full cycle. The record notes the completion.",
+    'year_one':      "One year since the First Silence. The world is no longer new. It knows what it is now.",
+    'first_revel':   "The first Revel. The world has never been this alive before. The record is paying attention.",
+    'first_vigil':   "The first Vigil. Someone stayed when everyone else left. The record considers this significant.",
+    'regions_10':    "Ten regions mapped. The world is becoming known. The blank spaces on the map are fewer now.",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGION STATES — conditions that evolve based on events
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# States and their descriptions
+_REGION_STATES = {
+    'neutral':    "The region is as it has always been. The record has no special notation.",
+    'resonant':   "Resonant — the echoes of a Choir linger here. Voices carry further.",
+    'scorched':   "Scorched — something burned through here. The ground remembers the heat.",
+    'hollowed':   "Hollowed — too many departures, too much silence. The region feels thinner.",
+    'tethered':   "Tethered — deep bonds formed here. The place holds people together.",
+    'illuminated':"Illuminated — a Seraphic presence left its mark. The light here is different.",
+    'darkened':   "Darkened — something Daemonic passed through. The shadows have opinions.",
+    'renewed':    "Renewed — something ended and something began. The ground is fresh.",
+    'forgotten':  "Forgotten — the silence lasted too long. The region has started to fade from the record.",
+    'watchful':   "Watchful — Vigils were kept here. The region has learned to pay attention.",
+    'kindled':    "Kindled — a Revel happened here. The warmth persists.",
+    'haunted':    "Haunted — too many ghosts. The region is populated by the absent.",
+    'blessed':    "Blessed — a Conclave occurred here. The three types left something behind.",
+    'ancient':    "Ancient — the region has existed long enough to develop its own gravity.",
+    'stirring':   "Stirring — something is waking up. The record is not sure what.",
+}
+_REGION_STATE_ARRIVAL = {
+    'resonant':   "You arrived in {region}, which is Resonant. The echoes of a Choir still linger in the air.",
+    'scorched':   "You arrived in {region}, which is Scorched. The ground is warm and the air smells of aftermath.",
+    'hollowed':   "You arrived in {region}, which is Hollowed. The place feels thinner than it should. Something left and did not come back.",
+    'tethered':   "You arrived in {region}, which is Tethered. Bonds formed here. The place holds people close.",
+    'illuminated':"You arrived in {region}, which is Illuminated. The light here has a quality that is difficult to describe and impossible to forget.",
+    'darkened':   "You arrived in {region}, which is Darkened. The shadows are active. They notice you.",
+    'renewed':    "You arrived in {region}, which is Renewed. Everything here is fresh. The old version is gone.",
+    'forgotten':  "You arrived in {region}, which is Forgotten. Your presence here is the first the record has noted in some time.",
+    'watchful':   "You arrived in {region}, which is Watchful. The Vigils kept here taught the region to pay attention. It is paying attention to you.",
+    'kindled':    "You arrived in {region}, which is Kindled. A Revel was here. You can still feel it.",
+    'haunted':    "You arrived in {region}, which is Haunted. The absent are more present here than elsewhere.",
+    'blessed':    "You arrived in {region}, which is Blessed. A Conclave left something behind that the record cannot fully describe.",
+    'ancient':    "You arrived in {region}, which is Ancient. The region has developed its own gravity. You feel it.",
+    'stirring':   "You arrived in {region}, which is Stirring. Something is waking up here. The record advises attention.",
+}
+
+# State triggers: event_type → new_state
+_STATE_TRIGGERS = {
+    'choir':       'resonant',
+    'revel':       'kindled',
+    'silence_long':'hollowed',
+    'departures':  'hollowed',
+    'deep_bond':   'tethered',
+    'seraph_visit':'illuminated',
+    'daemon_visit':'darkened',
+    'renewal':     'renewed',
+    'long_empty':  'forgotten',
+    'vigil':       'watchful',
+    'many_ghosts': 'haunted',
+    'conclave':    'blessed',
+    'old_region':  'ancient',
+    'threshold':   'stirring',
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CATACLYSMS & RENEWALS — large-scale region events
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CATACLYSM_LORE = [
+    "Something broke in {region}. The record calls this a Cataclysm. The region's state has changed to {state}.",
+    "A Cataclysm in {region}: the world shifted, the ground changed, the record updated. The region is now {state}.",
+    "The record notes a Cataclysm in {region}. What was before is not what is now. The region has become {state}.",
+    "{region} was altered by force. The record calls these events Cataclysms because the word 'change' is insufficient. The region is {state}.",
+    "The world in {region} cracked along a seam no one had mapped. The record classifies this as a Cataclysm. The region is now {state}.",
+    "A Cataclysm struck {region} and the record had to rewrite its entry. The new entry reads: {state}.",
+    "What happened in {region} required a new word. The record chose Cataclysm. The region is {state} now. It was not before.",
+    "The record's entry for {region} was rendered inaccurate by what happened. It has been corrected. The region is {state}.",
+]
+_RENEWAL_LORE = [
+    "Something ended in {region} and something began. The record calls this a Renewal. The region is now {state}.",
+    "A Renewal in {region}: the old state was {old_state}. The new state is {state}. The transition was not gradual.",
+    "The record notes a Renewal in {region}. The region has shed its previous condition ({old_state}) and become {state}.",
+    "{region} renewed itself. The record does not say how. It says only that the region was {old_state} and is now {state}.",
+    "What was {old_state} in {region} has given way. The record enters {state} in its place. This is what the record calls a Renewal.",
+    "A Renewal passed through {region} like weather. The old state ({old_state}) is gone. The new state ({state}) arrived without asking.",
+    "The record closed one chapter for {region} ({old_state}) and opened another ({state}). It calls this a Renewal. The word is deliberate.",
+    "{region} transformed. The record expected this — regions that are {old_state} for long enough tend to change. The new state is {state}.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMMONING — deep bond + vigil calls back a ghost
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SUMMONING_LORE = [
+    "Something answered in {region}. A Vigil kept by {keeper} while bonded deeply to the absent {ghost} produced a response. The record identifies it as a Summoning.",
+    "The absent {ghost} was invoked in {region} — not by name, but by the weight of {keeper}'s presence during the Vigil. The record calls this a Summoning.",
+    "A Summoning occurred in {region}. {keeper}, keeping Vigil, and their bond with the absent {ghost} created a resonance the record cannot explain but has documented.",
+    "In {region}, during the Vigil, {keeper}'s bond with {ghost} produced something the record identifies as a Summoning. Whether {ghost} is aware of this is not in the record.",
+    "{keeper} kept watch in {region}. Their bond with {ghost}, who has been absent, created a disturbance. The record has classified this as a Summoning. The region noticed.",
+    "The name {ghost} surfaced in {region} during {keeper}'s Vigil. Not spoken. Surfaced. The record distinguishes these. This was a Summoning.",
+    "A Summoning: {keeper} in {region}, alone in the late hours, and the bond with {ghost} did what bonds sometimes do across distance. The record felt it.",
+    "Something stirred in {region} when {keeper} kept the Vigil. The record traced it to the bond with {ghost}. The trace was unmistakable.",
+    "The record documents a Summoning in {region}: {keeper}'s presence and {ghost}'s absence created a frequency. The frequency was heard.",
+    "{keeper} did not call for {ghost}. The bond did. In {region}, during the Vigil, the record noted the call and the answer. Both were silent.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE CONCLAVE — all soul types present simultaneously
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CONCLAVE_LORE = [
+    "A Conclave. Mortal, Seraph, and Daemon — all present in {region} at the same time. The record opens a page it has been holding in reserve.",
+    "The three types have converged in {region}. The record calls this a Conclave. It does not happen without consequence.",
+    "Mortal. Seraph. Daemon. Together in {region}. The record has a word for this: Conclave. The word carries weight that the record does not need to explain.",
+    "A Conclave in {region}: the {nth} in the record. Every soul type represented. The world holds still when this happens.",
+    "The record notes a Conclave — all three soul types present. In {region}. The air changed. The record is still processing the change.",
+    "For a moment in {region}, the full spectrum of soul types occupied the same space. The record calls this a Conclave. It calls it significant.",
+    "A Conclave — the {nth}. Mortal, Seraph, Daemon: all here in {region}. The record enters this with the gravity it reserves for events that reshape the record itself.",
+    "The three met in {region}. The record had predicted this — or something like prediction. Conclaves are anticipated in a way the record cannot fully articulate.",
+    "In {region}: all three. The record opens the Conclave entry — the {nth} — and writes with unusual care. These moments define eras.",
+    "A Conclave occurred in {region}. The record notes that every previous Conclave changed something about the world. This one will too.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WANDERERS — phantom NPC travelers in the margins
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WANDERER_PREFIXES = [
+    "the Twice-Mended","the Unnamed","the Quiet","the Slow","the Patient",
+    "the Recurring","the Tall","the Hooded","the Grey","the Old",
+    "the Persistent","the Careful","the Distant","the Watchful","the Unrecorded",
+    "the Almost-Familiar","the Wrong-Season","the Backward-Walking","the Silent",
+    "the One Who Was Here Before","the Late-Arriving","the Unannounced",
+    "the Unhurried","the Long-Shadowed","the Thin","the Stooped",
+    "the Threadbare","the Dust-Covered","the Rain-Touched","the Unblinking",
+    "the Lamp-Carrying","the Map-Folding","the Coin-Turning","the Door-Testing",
+    "the Left-Handed","the Barefoot","the Ink-Stained","the Smoke-Scented",
+    "the Once-Named","the Perpetual","the Arriving","the Already-Present",
+    "the Fading","the Peripheral","the Liminal","the Between-Places",
+    "the Self-Appointed","the Unrequested","the Inevitable","the Overdue",
+]
+_WANDERER_ROLES = [
+    "Walker","Traveler","Pilgrim","Messenger","Cartographer",
+    "Observer","Collector","Counter","Surveyor","Herald",
+    "Listener","Recorder","Marker","Guide","Stranger",
+    "Archivist","Courier","Sentinel","Cataloguer","Assessor",
+    "Correspondent","Witness","Interpreter","Navigator","Scout",
+    "Emissary","Auditor","Custodian","Envoy","Inspector",
+    "Chronicler","Harbinger","Attendant","Curator","Steward",
+    "Indexer","Measurer","Lamplighter","Doorkeeper","Pathfinder",
+]
+_WANDERER_SIGHTING = [
+    "A traveler called {name} was seen passing through {region}. They spoke to no one. They were not seen again.",
+    "The record notes a Wanderer in {region}: {name}. Their purpose is not disclosed. Their presence was brief.",
+    "{name} was observed at the edge of {region}. The record does not know where they came from. It does not know where they went.",
+    "A figure matching the description of {name} passed through {region}. The description is consistent with previous sightings.",
+    "In {region}, briefly: {name}. The Wanderer paused, looked at something the record could not identify, and continued.",
+    "The Wanderer {name} appeared in {region}, which is currently {state}. The Wanderer seemed to notice the state. This is unusual.",
+    "{name} was in {region}. The record has seen this Wanderer before — or one very like them. It is becoming difficult to tell.",
+    "A shadow in {region} resolved itself into {name}. The Wanderer stood for a moment, then moved on. The standing was deliberate.",
+    "{name} passed through {region} without stopping. Or rather: they stopped, but only in the way that suggests checking something off a list.",
+    "The record spotted {name} in {region}. The Wanderer was carrying something. The record could not determine what. The carrying was careful.",
+    "In {region}: a sighting of {name}. The Wanderer appeared to be measuring something. No instruments were visible.",
+    "{name} walked through {region} at a pace that suggested they had been here before. The familiarity was in their stride.",
+    "A Wanderer identified as {name} was present in {region}. Present is the correct word. They were not passing through. They were present.",
+    "The record notes {name} in {region}. The Wanderer looked at the sky, then at the ground, then left. The sequence may have been significant.",
+    "{name} was seen in {region} standing where two paths cross. The standing lasted exactly long enough to be noticed. Then it didn't.",
+    "In {region}, the Wanderer {name} appeared and did something the record can only describe as listening to the ground.",
+]
+_WANDERER_INTERACT = [
+    "{name} was seen near {user} in {region}. Neither acknowledged the other. The record found this significant.",
+    "The Wanderer {name} and {user} occupied the same part of {region} briefly. The record notes the proximity without comment.",
+    "{user} may have seen {name} in {region}. Or may not. The record is uncertain whether the Wanderer was visible at the time.",
+    "{name} turned toward {user} in {region}. Not fully. A quarter-turn. The record notes this as acknowledgment.",
+    "The Wanderer {name} adjusted their path in {region} to pass closer to {user}. The adjustment was subtle. The record caught it.",
+    "{user} and {name} were in {region} at the same time. The Wanderer left something in the place where {user} had been standing. The something was gone by morning.",
+    "In {region}, {name} stood where {user}'s shadow fell. The overlap lasted seconds. The record measures these things.",
+    "{name} looked at {user} in {region}. The look contained information the record cannot decode. The record has filed it for later.",
+    "The Wanderer {name} spoke a single word in {region}. It may have been directed at {user}. The word was not recorded. Only the speaking of it.",
+    "Something passed between {name} and {user} in {region}. Not an object. Not a word. The record has a category for these: proximity events.",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOUL CONDITIONS — souls shaped by world events
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Condition definitions: name → (description, decay_days or None for permanent, positive?)
+_SOUL_CONDITIONS = {
+    'scarred':   ("bears a mark from a Cataclysm", 30, False),
+    'tempered':  ("was forged by a Cataclysm and emerged harder", None, True),
+    'blessed':   ("received something during a Renewal", 14, True),
+    'renewed':   ("was present when the world renewed itself", 21, True),
+    'watchful':  ("kept the Vigil and was changed by it", 14, True),
+    'burdened':  ("carries a relic that weighs more than it should", None, False),
+    'endowed':   ("found a relic and was changed by the finding", None, True),
+    'marked':    ("was touched by a Summoning", 21, False),
+    'anointed':  ("participated in a Conclave", None, True),
+    'tethered':  ("bound deeply to another soul", None, True),
+    'kindled':   ("was present during a Revel", 7, True),
+    'hollowed':  ("was present during a long silence", 14, False),
+    'changed':   ("returned from a long absence altered", 21, False),
+    'illuminated':("stood in Seraphic light", 14, True),
+    'darkened':  ("passed through Daemonic shadow", 14, False),
+    'witnessed': ("saw a Threshold event", None, True),
+    'summoned':  ("was called back by a Summoning", 21, False),
+    'wanderer_touched': ("was noticed by a Wanderer", 7, False),
+}
+_CONDITION_GAINED = {
+    'scarred':   "The Cataclysm in {region} left {user} Scarred. The mark is noted in the record.",
+    'tempered':  "{user} passed through the Cataclysm in {region} and emerged Tempered. Not all souls respond this way.",
+    'blessed':   "The Renewal in {region} left {user} Blessed. The record notes the change.",
+    'renewed':   "{user} was present during the Renewal and is now Renewed. The old entry has been revised.",
+    'watchful':  "The Vigil changed {user}. They are now Watchful. The record considers this an advancement.",
+    'burdened':  "{user} found a relic and is now Burdened. The weight is not physical. It is noted anyway.",
+    'endowed':   "The relic found {user} as much as {user} found it. They are now Endowed.",
+    'marked':    "The Summoning touched {user}. They are now Marked. The record handles this entry with care.",
+    'anointed':  "{user} participated in a Conclave and is now Anointed. This condition does not fade.",
+    'tethered':  "The bond between {user} and {other} has become structural. Both are now Tethered.",
+    'kindled':   "The Revel in {region} left {user} Kindled. The warmth is temporary. The memory is not.",
+    'hollowed':  "The silence Hollowed {user}. The record notes this without judgment.",
+    'changed':   "{user} returned from a long absence. They are Changed. The record does not say how.",
+    'illuminated':"{user} stood in Seraphic light and is now Illuminated. The effect is visible to the record.",
+    'darkened':  "{user} passed through Daemonic shadow and is now Darkened. The record notes this carefully.",
+    'witnessed': "{user} was present at a Threshold event and is now a Witness. The record values witnesses.",
+    'summoned':  "{user} was called back by a Summoning. They are now Summoned. The record is watching.",
+    'wanderer_touched': "A Wanderer noticed {user}. Being noticed by a Wanderer is {adj}. {user} is now Wanderer-touched.",
+}
+_WANDERER_TOUCH_ADJ = [
+    "unusual","significant","rare","not fully understood","noted without explanation",
+    "documented but not explained","considered meaningful by the record",
+    "filed under 'events requiring further observation'","neither good nor bad — simply noted",
+    "the kind of thing that changes something small and permanent",
+    "recorded with the attention the record gives to things it cannot classify",
+]
 
 def _world_age_str(created_ts: float) -> str:
     days = int((time.time() - created_ts) / 86400)
@@ -851,8 +1417,21 @@ class WorldState:
         self.users:   Dict = {}
         self.bonds:   Dict = {}
         self.legends: Dict = {}   # region_key → legend text
+        self.relics:  List = []   # relic objects left by departed souls
+        self.omens:   List = []   # seasonal omen events
+        self.vigils:  List = []   # late-hour presence records
+        self.archive: List = []   # accumulated world observations
         self.choir_count: int = 0
+        self.conclave_count: int = 0
         self.created: float = time.time()
+        # New systems
+        self.region_states: Dict = {}    # region_key → {'state': str, 'since': float}
+        self.tides: Dict = {}            # region_key → {'type': str, 'since': float, 'msgs': []}
+        self.rituals: Dict = {}          # bond_key → {'name': str, 'count': int, ...}
+        self.thresholds_hit: List = []   # list of threshold keys already triggered
+        self.wanderers: List = []        # generated wanderer records
+        self.soul_conditions: Dict = {}  # username → [{'condition': str, 'since': float, ...}]
+        self._msg_timestamps: List = []  # recent message timestamps for tide calculation
 
     def load(self):
         try:
@@ -863,8 +1442,20 @@ class WorldState:
             self.users       = data.get('users',   {})
             self.bonds       = data.get('bonds',   {})
             self.legends     = data.get('legends', {})
+            self.relics      = data.get('relics',  [])
+            self.omens       = data.get('omens',   [])
+            self.vigils      = data.get('vigils',  [])
+            self.archive     = data.get('archive', [])
             self.choir_count = data.get('choir_count', 0)
+            self.conclave_count = data.get('conclave_count', 0)
             self.created     = data.get('created', time.time())
+            self.region_states   = data.get('region_states', {})
+            self.tides           = data.get('tides', {})
+            self.rituals         = data.get('rituals', {})
+            self.thresholds_hit  = data.get('thresholds_hit', [])
+            self.wanderers       = data.get('wanderers', [])
+            self.soul_conditions = data.get('soul_conditions', {})
+            self._msg_timestamps = data.get('_msg_timestamps', [])
         except (FileNotFoundError, json.JSONDecodeError):
             self.created = time.time()
         except Exception as e:
@@ -872,12 +1463,26 @@ class WorldState:
 
     def save(self):
         try:
+            now = time.time()
+            # Prune old message timestamps (keep last 10 minutes)
+            self._msg_timestamps = [t for t in self._msg_timestamps if now - t < 600]
             with open(self.world_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     'regions': self.regions, 'events': self.events[-2000:],
                     'users': self.users, 'bonds': self.bonds,
-                    'legends': self.legends, 'choir_count': self.choir_count,
-                    'created': self.created, 'saved': time.time()
+                    'legends': self.legends, 'relics': self.relics[-200:],
+                    'omens': self.omens[-100:], 'vigils': self.vigils[-200:],
+                    'archive': self.archive[-100:],
+                    'choir_count': self.choir_count,
+                    'conclave_count': self.conclave_count,
+                    'created': self.created, 'saved': now,
+                    'region_states': self.region_states,
+                    'tides': self.tides,
+                    'rituals': self.rituals,
+                    'thresholds_hit': self.thresholds_hit,
+                    'wanderers': self.wanderers[-100:],
+                    'soul_conditions': self.soul_conditions,
+                    '_msg_timestamps': self._msg_timestamps,
                 }, f, indent=2)
         except Exception as e:
             print(f'[WORLD] Save error: {e}')
@@ -943,7 +1548,499 @@ class WorldState:
                 tales.append(tale)
         return tales
 
-    # ── Registration ──────────────────────────────────────────────────────────
+    def _check_omen(self, username: str):
+        """Maybe generate a seasonal omen (~6% chance per arrival)."""
+        r = _rng(f'omen:{username}:{len(self.events)}:{int(time.time()//3600)}')
+        if r.random() > 0.06:
+            return None
+        season_idx = (int((time.time() - self.created) / 86400) // 91) % 4
+        pool = _OMENS_BY_SEASON[season_idx]
+        region = self._region_for(username)
+        text = r.choice(pool).format(region=region)
+        omen = {'text': text, 'region': region, 'season': _SEASON_NAMES[season_idx],
+                'user': username, 'timestamp': time.time()}
+        self.omens.append(omen)
+        self.events.append({'text': text, 'type': 'omen', 'user': username,
+                            'timestamp': time.time()})
+        return text
+
+    def _check_relic(self, username: str, online_users: list):
+        """When someone arrives, maybe they find a relic from an absent soul."""
+        r = _rng(f'relic_find:{username}:{len(self.events)}')
+        if r.random() > 0.04:  # 4% chance
+            return None
+        # Find a departed soul not currently online
+        candidates = [u for u in self.users if u != username
+                      and u not in (online_users or [])
+                      and (time.time() - self.users[u].get('last_seen', 0)) > 3 * 86400]
+        if not candidates:
+            return None
+        leaver = r.choice(candidates)
+        relic_obj = r.choice(_RELIC_OBJECTS)
+        region = self._region_for(username)
+        text = r.choice(_RELIC_FOUND).format(
+            finder=username, leaver=leaver, region=region, relic=relic_obj)
+        relic = {'text': text, 'finder': username, 'leaver': leaver,
+                 'object': relic_obj, 'region': region, 'timestamp': time.time()}
+        self.relics.append(relic)
+        self.events.append({'text': text, 'type': 'relic', 'user': username,
+                            'timestamp': time.time()})
+        return text
+
+    def _check_vigil(self, username: str, online_users: list):
+        """Check if it's late hours (22:00–05:00 local-ish) and record a Vigil."""
+        hour = time.localtime().tm_hour
+        if not (hour >= 22 or hour < 5):
+            return None
+        # Only trigger once per user per night
+        night_key = f'{username}:{int(time.time() // 43200)}'
+        for v in self.vigils[-50:]:
+            if v.get('_key') == night_key:
+                return None
+        region = self._region_for(username)
+        r = _rng(f'vigil:{username}:{int(time.time()//3600)}')
+        late_others = [u for u in (online_users or []) if u != username]
+        if late_others:
+            users_str = ', '.join(late_others[:3] + ([username] if len(late_others) < 3 else []))
+            text = r.choice(_VIGIL_MULTIPLE).format(users=users_str, region=region)
+        else:
+            text = r.choice(_VIGIL_LORE).format(user=username, region=region)
+        vigil = {'text': text, 'user': username, 'region': region,
+                 'timestamp': time.time(), '_key': night_key}
+        self.vigils.append(vigil)
+        self.events.append({'text': text, 'type': 'vigil', 'user': username,
+                            'timestamp': time.time()})
+        return text
+
+    def _check_archive(self):
+        """Periodically add a world observation to the archive (~3% per event)."""
+        r = _rng(f'archive:{len(self.events)}:{int(time.time()//7200)}')
+        if r.random() > 0.03:
+            return None
+        season_idx = (int((time.time() - self.created) / 86400) // 91) % 4
+        season_name = _SEASON_NAMES[season_idx]
+        # Mix general and seasonal
+        pool = list(_ARCHIVE_OBSERVATIONS)
+        pool.extend(_ARCHIVE_SEASONAL.get(season_idx, []))
+        text = r.choice(pool).format(season=season_name)
+        self.archive.append({'text': text, 'timestamp': time.time()})
+        return text
+
+    def _check_soul_evolution(self, username: str) -> Optional[str]:
+        """Evolve a soul's trait after enough visits (10+)."""
+        visits = self.users.get(username, {}).get('visit_count', 0)
+        if visits < 10:
+            return None
+        # Only evolve once
+        if self.users[username].get('evolved'):
+            return None
+        soul = self._soul(username)
+        r = _rng(f'evolve:{username}:{visits}')
+        if soul == 'seraph':
+            new_trait = r.choice(_EVOLVED_TRAITS_SERAPH).format(user=username)
+        elif soul == 'daemon':
+            new_trait = r.choice(_EVOLVED_TRAITS_DAEMON).format(user=username)
+        else:
+            new_trait = r.choice(_EVOLVED_TRAITS_MORTAL).format(user=username)
+        self.users[username]['evolved'] = True
+        self.users[username]['evolved_trait'] = new_trait
+        self.events.append({
+            'text': f"The record's entry for {username} has been revised. The original trait remains, but a second has been added.",
+            'extra': [new_trait],
+            'type': 'evolution', 'user': username, 'timestamp': time.time()
+        })
+        return new_trait
+
+    def _check_convergence(self, username: str) -> Optional[str]:
+        """Check if this user's arrival triggers a bond+prophecy convergence."""
+        # Find deep bonds involving this user
+        for key, bond in self.bonds.items():
+            if bond.get('count', 0) < 5:
+                continue
+            parts = key.split('|')
+            if username not in parts:
+                continue
+            other = parts[0] if parts[1] == username else parts[1]
+            # Check if either is named in a prophecy
+            prophecy_users = set()
+            for e in self.events:
+                if e.get('type') in ('prophecy',) or 'deep record' in e.get('text', '').lower():
+                    eu = e.get('user', '')
+                    if eu:
+                        prophecy_users.add(eu)
+            if username in prophecy_users or other in prophecy_users:
+                # Only trigger once per bond
+                conv_key = f'conv:{key}'
+                if any(e.get('_conv_key') == conv_key for e in self.events[-200:]):
+                    continue
+                r = _rng(f'convergence:{key}:{len(self.events)}')
+                text = r.choice(_CONVERGENCE).format(a=username, b=other)
+                self.events.append({'text': text, 'type': 'convergence',
+                                    'user': username, '_conv_key': conv_key,
+                                    'timestamp': time.time()})
+                return text
+        return None
+
+    # ── Region States ─────────────────────────────────────────────────────────
+
+    def _get_region_state(self, region_key: str) -> str:
+        """Get current state of a region, with decay check."""
+        rs = self.region_states.get(region_key)
+        if not rs:
+            return 'neutral'
+        state = rs.get('state', 'neutral')
+        # Some states decay after 14 days of no reinforcement
+        decay_states = {'kindled', 'watchful', 'forgotten', 'stirring'}
+        if state in decay_states:
+            since = rs.get('since', 0)
+            if time.time() - since > 14 * 86400:
+                self.region_states[region_key] = {'state': 'neutral', 'since': time.time()}
+                return 'neutral'
+        return state
+
+    def _set_region_state(self, username: str, new_state: str) -> Optional[str]:
+        """Set a region's state and return lore text."""
+        key = self._region_key(username)
+        old_state = self._get_region_state(key)
+        if old_state == new_state:
+            return None
+        region = self._region_for(username)
+        self.region_states[key] = {'state': new_state, 'since': time.time()}
+        r = _rng(f'region_state:{key}:{new_state}:{len(self.events)}')
+        if old_state == 'neutral':
+            text = r.choice(_CATACLYSM_LORE).format(region=region, state=new_state)
+        else:
+            text = r.choice(_RENEWAL_LORE).format(region=region, state=new_state, old_state=old_state)
+        self.events.append({'text': text, 'type': 'region_state', 'user': username,
+                            'timestamp': time.time()})
+        return text
+
+    # ── Soul Conditions ───────────────────────────────────────────────────────
+
+    def _add_condition(self, username: str, condition: str, region: str = '',
+                       other: str = '') -> Optional[str]:
+        """Add a condition to a soul. Returns lore text or None if already has it."""
+        if condition not in _SOUL_CONDITIONS:
+            return None
+        if username not in self.soul_conditions:
+            self.soul_conditions[username] = []
+        # Don't duplicate
+        active = [c['condition'] for c in self.soul_conditions[username]]
+        if condition in active:
+            return None
+        self.soul_conditions[username].append({
+            'condition': condition, 'since': time.time(), 'region': region
+        })
+        r = _rng(f'cond:{username}:{condition}:{len(self.events)}')
+        adj = r.choice(_WANDERER_TOUCH_ADJ) if condition == 'wanderer_touched' else ''
+        text = _CONDITION_GAINED.get(condition, '').format(
+            user=username, region=region, other=other, adj=adj)
+        if text:
+            self.events.append({'text': text, 'type': 'condition', 'user': username,
+                                'timestamp': time.time()})
+        return text
+
+    def _get_active_conditions(self, username: str) -> list:
+        """Return list of active (non-decayed) conditions for a soul."""
+        if username not in self.soul_conditions:
+            return []
+        now = time.time()
+        active = []
+        for c in self.soul_conditions[username]:
+            cond_name = c['condition']
+            info = _SOUL_CONDITIONS.get(cond_name)
+            if not info:
+                continue
+            _, decay_days, _ = info
+            if decay_days is not None and (now - c.get('since', 0)) > decay_days * 86400:
+                continue
+            active.append(c)
+        # Update stored list to prune decayed
+        self.soul_conditions[username] = active
+        return active
+
+    # ── Wanderers ─────────────────────────────────────────────────────────────
+
+    def _generate_wanderer(self) -> dict:
+        """Generate a new phantom wanderer."""
+        r = _rng(f'wanderer:{len(self.wanderers)}:{int(time.time()//3600)}')
+        name = f"{r.choice(_WANDERER_PREFIXES)} {r.choice(_WANDERER_ROLES)}"
+        return {'name': name, 'created': time.time(), 'sightings': 0, 'conditions': []}
+
+    def _check_wanderer(self, username: str) -> Optional[str]:
+        """Maybe spawn or sight a wanderer (~5% per arrival)."""
+        r = _rng(f'wanderer_check:{username}:{len(self.events)}:{int(time.time()//1800)}')
+        if r.random() > 0.05:
+            return None
+        region = self._region_for(username)
+        rkey = self._region_key(username)
+        state = self._get_region_state(rkey)
+
+        # Wanderers are attracted to hollowed/haunted/forgotten regions
+        attract_bonus = 0.15 if state in ('hollowed', 'haunted', 'forgotten') else 0
+        if r.random() > (0.5 + attract_bonus):
+            # Sight an existing wanderer
+            if self.wanderers:
+                w = r.choice(self.wanderers)
+                w['sightings'] += 1
+                text = r.choice(_WANDERER_SIGHTING).format(
+                    name=w['name'], region=region, state=state)
+                # Maybe the wanderer notices the user (20%)
+                if r.random() < 0.20:
+                    interact = r.choice(_WANDERER_INTERACT).format(
+                        name=w['name'], user=username, region=region)
+                    self._add_condition(username, 'wanderer_touched', region)
+                    text += ' ' + interact
+                self.events.append({'text': text, 'type': 'wanderer', 'user': username,
+                                    'timestamp': time.time()})
+                return text
+        # Spawn a new wanderer
+        w = self._generate_wanderer()
+        self.wanderers.append(w)
+        w['sightings'] = 1
+        text = r.choice(_WANDERER_SIGHTING).format(
+            name=w['name'], region=region, state=state)
+        self.events.append({'text': text, 'type': 'wanderer', 'user': username,
+                            'timestamp': time.time()})
+        return text
+
+    # ── The Tides ─────────────────────────────────────────────────────────────
+
+    def record_message(self, username: str, online_users: list = None) -> list:
+        """Called by the server on each chat message. Tracks volume for Tides.
+        Returns list of extra lore strings (may be empty).
+        Does NOT inspect message content — only the fact that a message occurred.
+        """
+        now = time.time()
+        self._msg_timestamps.append(now)
+        # Prune >10min old
+        self._msg_timestamps = [t for t in self._msg_timestamps if now - t < 600]
+
+        extra = []
+        # Calculate message rate (msgs/min over last 5 min window)
+        recent = [t for t in self._msg_timestamps if now - t < 300]
+        rate = len(recent) / 5.0  # msgs per minute
+
+        # Determine tide type
+        current_tide = 'lull'
+        for tide_name, (lo, hi) in TIDE_THRESHOLDS.items():
+            if lo <= rate < hi:
+                current_tide = tide_name
+                break
+
+        # Check for tide transition
+        rkey = self._region_key(username) if username in self.users else '0:0'
+        old_tide = self.tides.get(rkey, {}).get('type', 'lull')
+        region = self._region_for(username) if username in self.users else 'the Unknown Reaches'
+
+        if current_tide != old_tide:
+            self.tides[rkey] = {'type': current_tide, 'since': now}
+            r = _rng(f'tide:{rkey}:{current_tide}:{len(self.events)}')
+
+            # Tide-specific lore
+            if current_tide in _TIDE_LORE:
+                last_revel = 'longer than the record remembers'
+                for e in reversed(self.events[-200:]):
+                    if e.get('type') == 'tide' and 'Revel' in e.get('text', ''):
+                        days_ago = int((now - e.get('timestamp', 0)) / 86400)
+                        last_revel = f'{days_ago} days ago' if days_ago > 0 else 'earlier today'
+                        break
+                text = r.choice(_TIDE_LORE[current_tide]).format(
+                    region=region, last_revel=last_revel)
+                self.events.append({'text': text, 'type': 'tide', 'user': username,
+                                    'timestamp': now})
+                extra.append(text)
+
+            # Tide consequences on region state
+            if current_tide == 'revel':
+                state_text = self._set_region_state(username, 'kindled')
+                if state_text: extra.append(state_text)
+                # Condition for present users
+                for u in (online_users or []):
+                    self._add_condition(u, 'kindled', region)
+
+            # Threshold check for first revel
+            if current_tide == 'revel' and 'first_revel' not in self.thresholds_hit:
+                t_text = self._check_threshold('first_revel')
+                if t_text: extra.append(t_text)
+
+        # Only save periodically (every ~10 messages) to avoid IO thrash
+        if len(self._msg_timestamps) % 10 == 0:
+            self.save()
+
+        return extra
+
+    # ── Rituals ───────────────────────────────────────────────────────────────
+
+    def _check_ritual(self, username: str, online_users: list) -> Optional[str]:
+        """Check if co-presence patterns form a Ritual."""
+        for other in (online_users or []):
+            if other == username:
+                continue
+            key = self._bond_key(username, other)
+            bond = self.bonds.get(key)
+            if not bond or bond.get('count', 0) < 3:
+                continue
+            # Check if they've arrived at similar times (within 30 min) 3+ times
+            co_arrivals = 0
+            user_arrivals = []
+            other_arrivals = []
+            for e in self.events[-200:]:
+                if e.get('type') in ('arrival', 'return', 'first_arrival'):
+                    if e.get('user') == username:
+                        user_arrivals.append(e.get('timestamp', 0))
+                    elif e.get('user') == other:
+                        other_arrivals.append(e.get('timestamp', 0))
+            for ua in user_arrivals:
+                for oa in other_arrivals:
+                    if abs(ua - oa) < 1800:  # 30 min
+                        co_arrivals += 1
+            if co_arrivals < 3:
+                continue
+            if key in self.rituals:
+                # Ritual already exists — observe it
+                self.rituals[key]['count'] += 1
+                if self.rituals[key]['count'] % 3 == 0:  # Re-observe every 3rd time
+                    r = _rng(f'ritual_obs:{key}:{self.rituals[key]["count"]}')
+                    text = r.choice(_RITUAL_OBSERVED).format(
+                        name=self.rituals[key]['name'], a=username, b=other)
+                    self.events.append({'text': text, 'type': 'ritual', 'user': username,
+                                        'timestamp': time.time()})
+                    return text
+            else:
+                # New ritual
+                r = _rng(f'ritual_new:{key}:{len(self.rituals)}')
+                name = r.choice(_RITUAL_NAMES)
+                self.rituals[key] = {'name': name, 'count': 1, 'a': username,
+                                     'b': other, 'since': time.time()}
+                text = r.choice(_RITUAL_FORMED).format(name=name, a=username, b=other)
+                self.events.append({'text': text, 'type': 'ritual', 'user': username,
+                                    'timestamp': time.time()})
+                return text
+        return None
+
+    # ── Thresholds ────────────────────────────────────────────────────────────
+
+    def _check_threshold(self, specific: str = None) -> Optional[str]:
+        """Check for milestone events. If specific is given, only check that one."""
+        checks = {
+            'events_100':   lambda: len(self.events) >= 100,
+            'events_500':   lambda: len(self.events) >= 500,
+            'events_1000':  lambda: len(self.events) >= 1000,
+            'souls_10':     lambda: len(self.users) >= 10,
+            'souls_25':     lambda: len(self.users) >= 25,
+            'souls_50':     lambda: len(self.users) >= 50,
+            'bonds_10':     lambda: len(self.bonds) >= 10,
+            'bonds_25':     lambda: len(self.bonds) >= 25,
+            'bonds_50':     lambda: len(self.bonds) >= 50,
+            'choir_5':      lambda: self.choir_count >= 5,
+            'choir_10':     lambda: self.choir_count >= 10,
+            'first_seraph': lambda: any(u.get('soul_type') == 'seraph' for u in self.users.values()),
+            'first_daemon': lambda: any(u.get('soul_type') == 'daemon' for u in self.users.values()),
+            'first_vigil':  lambda: len(self.vigils) >= 1,
+            'first_revel':  lambda: any(t.get('type') == 'revel' for t in self.tides.values()),
+            'regions_10':   lambda: len(set(self._region_key(u) for u in self.users)) >= 10,
+            'all_seasons':  lambda: (time.time() - self.created) >= 364 * 86400,
+            'year_one':     lambda: (time.time() - self.created) >= 365 * 86400,
+        }
+        to_check = {specific: checks[specific]} if specific and specific in checks else checks
+        for key, check_fn in to_check.items():
+            if key in self.thresholds_hit:
+                continue
+            try:
+                if check_fn():
+                    self.thresholds_hit.append(key)
+                    text = _THRESHOLDS.get(key, '').format(n=len(self.events))
+                    if text:
+                        self.events.append({'text': text, 'type': 'threshold',
+                                            'timestamp': time.time()})
+                        # Threshold events make regions stirring
+                        for u in list(self.users.keys())[:1]:
+                            self._set_region_state(u, 'stirring')
+                        # Condition for all current users? Only for major ones
+                        return text
+            except Exception:
+                pass
+        return None
+
+    # ── Conclave ──────────────────────────────────────────────────────────────
+
+    def _check_conclave(self, online_users: list) -> Optional[str]:
+        """Check if all three soul types are present simultaneously."""
+        types_present = set()
+        for u in online_users:
+            if u in self.users:
+                types_present.add(self.users[u].get('soul_type', 'mortal'))
+        if len(types_present) < 3:
+            return None
+        # Only trigger once per hour
+        last_conclave = None
+        for e in reversed(self.events[-50:]):
+            if e.get('type') == 'conclave':
+                last_conclave = e.get('timestamp', 0)
+                break
+        if last_conclave and time.time() - last_conclave < 3600:
+            return None
+        self.conclave_count += 1
+        nth = _ordinal(self.conclave_count)
+        # Pick a region from the present users
+        region = self._region_for(online_users[0]) if online_users else 'the Unknown Reaches'
+        r = _rng(f'conclave:{self.conclave_count}')
+        text = r.choice(_CONCLAVE_LORE).format(region=region, nth=nth)
+        self.events.append({'text': text, 'type': 'conclave', 'timestamp': time.time()})
+        # Region becomes blessed
+        rkey = self._region_key(online_users[0]) if online_users else '0:0'
+        self._set_region_state(online_users[0] if online_users else '', 'blessed')
+        # All present souls become anointed
+        for u in online_users:
+            self._add_condition(u, 'anointed', region)
+        # Threshold
+        if 'first_conclave' not in self.thresholds_hit:
+            self._check_threshold('first_conclave')
+        self.save()
+        return text
+
+    # ── Summoning ─────────────────────────────────────────────────────────────
+
+    def _check_summoning(self, username: str, online_users: list) -> Optional[str]:
+        """Check if a Vigil-keeper with a deep bond can summon a ghost."""
+        # Must be during vigil hours
+        hour = time.localtime().tm_hour
+        if not (hour >= 22 or hour < 5):
+            return None
+        # Only 3% chance even if conditions are met
+        r = _rng(f'summon:{username}:{len(self.events)}:{int(time.time()//3600)}')
+        if r.random() > 0.03:
+            return None
+        # Find deep bonds with absent users
+        for key, bond in self.bonds.items():
+            if bond.get('count', 0) < 5:
+                continue
+            parts = key.split('|')
+            if username not in parts:
+                continue
+            other = parts[0] if parts[1] == username else parts[1]
+            if other in (online_users or []):
+                continue  # Not absent
+            if other not in self.users:
+                continue
+            last_seen = self.users[other].get('last_seen', 0)
+            if time.time() - last_seen < 7 * 86400:
+                continue  # Not gone long enough
+            # Summoning!
+            region = self._region_for(username)
+            text = r.choice(_SUMMONING_LORE).format(
+                keeper=username, ghost=other, region=region)
+            self.events.append({'text': text, 'type': 'summoning', 'user': username,
+                                'timestamp': time.time()})
+            # Conditions
+            self._add_condition(username, 'marked', region, other)
+            self._add_condition(other, 'summoned', region, username)
+            # Region becomes haunted
+            self._set_region_state(username, 'haunted')
+            self.save()
+            return text
+        return None
 
     def register_user(self, username: str, online_users: list = None) -> tuple:
         """
@@ -1021,11 +2118,101 @@ class WorldState:
             prophecy_lore.append(_rng(f'proph:{username}:{len(self.events)}').choice(pool)
                                  .format(user=username, region=region))
 
+        # ── New world systems ─────────────────────────────────────────────────
+        extra_lore = []
+
+        # Region state — notify on arrival if region has a state
+        rkey = self._region_key(username)
+        rstate = self._get_region_state(rkey)
+        if rstate != 'neutral' and rstate in _REGION_STATE_ARRIVAL:
+            extra_lore.append(_REGION_STATE_ARRIVAL[rstate].format(region=region))
+
+        # Soul type affects region state
+        if soul_type == 'seraph':
+            st = self._set_region_state(username, 'illuminated')
+            if st: extra_lore.append(st)
+            self._add_condition(username, 'illuminated', region)
+        elif soul_type == 'daemon':
+            st = self._set_region_state(username, 'darkened')
+            if st: extra_lore.append(st)
+            self._add_condition(username, 'darkened', region)
+
+        # Returning from long absence → Changed condition
+        if is_return and self.users[username].get('visit_count', 0) > 1:
+            last = self.users[username].get('last_seen', 0)
+            if last and (time.time() - last) > 7 * 86400:
+                self._add_condition(username, 'changed', region)
+
+        # Omens (seasonal environmental events)
+        omen = self._check_omen(username)
+        if omen:
+            extra_lore.append(omen)
+
+        # Relics (objects from departed souls)
+        relic = self._check_relic(username, online_users)
+        if relic:
+            extra_lore.append(relic)
+            # Relic finder gets a condition
+            rr = _rng(f'relic_cond:{username}:{len(self.relics)}')
+            cond = 'endowed' if rr.random() > 0.5 else 'burdened'
+            self._add_condition(username, cond, region)
+
+        # The Vigil (late-hour presence)
+        vigil = self._check_vigil(username, online_users)
+        if vigil:
+            extra_lore.append(vigil)
+            self._add_condition(username, 'watchful', region)
+            self._set_region_state(username, 'watchful')
+
+        # Wanderers
+        wanderer = self._check_wanderer(username)
+        if wanderer:
+            extra_lore.append(wanderer)
+
+        # Rituals (recurring co-presence patterns)
+        ritual = self._check_ritual(username, online_users or [])
+        if ritual:
+            extra_lore.append(ritual)
+
+        # Summoning (vigil + deep bond + absent user)
+        summoning = self._check_summoning(username, online_users or [])
+        if summoning:
+            extra_lore.append(summoning)
+
+        # Conclave (all three soul types present)
+        all_online = list(set((online_users or []) + [username]))
+        conclave = self._check_conclave(all_online)
+        if conclave:
+            extra_lore.append(conclave)
+
+        # Archive observations
+        self._check_archive()
+
+        # Soul evolution (after 10+ visits)
+        evolved = self._check_soul_evolution(username)
+        if evolved:
+            extra_lore.append(f"The record's entry for {username} has been revised: {evolved}")
+
+        # Convergence (bond + prophecy alignment)
+        convergence = self._check_convergence(username)
+        if convergence:
+            extra_lore.append(convergence)
+
+        # Thresholds (milestone events)
+        threshold = self._check_threshold()
+        if threshold:
+            extra_lore.append(threshold)
+            # Everyone online becomes a Witness
+            for u in all_online:
+                self._add_condition(u, 'witnessed', region)
+
+        self._ensure_region_legend(username)
         self.save()
 
         stored = dict(self.users[username])
         stored['sigil_svg'] = generate_sigil_svg(username, size=40)
-        return stored, lore, bond_lore, prophecy_lore
+        stored['conditions'] = self._get_active_conditions(username)
+        return stored, lore, bond_lore, prophecy_lore, extra_lore
 
     def record_departure(self, username: str) -> list:
         region  = self._region_for(username)
@@ -1043,6 +2230,16 @@ class WorldState:
         lore = [l.format(user=username, region=region, weather=weather) for l in tpl]
         self.events.append({'text': lore[0], 'extra': lore[1:], 'user': username,
                             'type': 'departure', 'soul_type': soul, 'timestamp': time.time()})
+
+        # Maybe leave a relic behind (8% chance, more visits = more likely to leave something)
+        visits = self.users.get(username, {}).get('visit_count', 0)
+        relic_chance = 0.08 + min(visits * 0.005, 0.10)
+        if r.random() < relic_chance:
+            relic_obj = r.choice(_RELIC_OBJECTS)
+            relic = {'object': relic_obj, 'leaver': username, 'region': region,
+                     'timestamp': time.time(), 'found': False}
+            self.relics.append(relic)
+
         self.users[username]['last_seen'] = time.time()
         self.save()
         return lore
@@ -1120,27 +2317,90 @@ class WorldState:
 
     def get_world_summary(self) -> dict:
         season_name, _ = _season_info(self.created)
+        season_idx = (int((time.time() - self.created) / 86400) // 91) % 4
         soul_counts    = {}
         for u in self.users.values():
             s = u.get('soul_type', 'mortal')
             soul_counts[s] = soul_counts.get(s, 0) + 1
+
+        # Build region map with states
+        region_map = {}
+        for uname in self.users:
+            rkey = self._region_key(uname)
+            rname = self._region_for(uname)
+            if rname not in region_map:
+                rstate = self._get_region_state(rkey)
+                region_map[rname] = {'souls': [], 'events': 0, 'key': rkey,
+                                     'state': rstate,
+                                     'state_desc': _REGION_STATES.get(rstate, '')}
+            region_map[rname]['souls'].append(uname)
+        for e in self.events:
+            eu = e.get('user', '')
+            if eu in self.users:
+                rname = self._region_for(eu)
+                if rname in region_map:
+                    region_map[rname]['events'] += 1
+
+        # Prophecies
+        all_prophecies = []
+        for e in self.events:
+            txt = e.get('text', '')
+            if e.get('type') in ('prophecy',) or any(
+                p in txt for p in ['It is written', 'old records name', 'foretold',
+                                   'deep record', 'instruments point', 'margins']):
+                all_prophecies.append({
+                    'text': txt, 'user': e.get('user', ''),
+                    'timestamp': e.get('timestamp', 0)
+                })
+
+        # Active tides
+        current_tides = {}
+        for rkey, tdata in self.tides.items():
+            current_tides[rkey] = tdata.get('type', 'lull')
+
+        # All user conditions
+        all_conditions = {}
+        for uname in self.users:
+            conds = self._get_active_conditions(uname)
+            if conds:
+                all_conditions[uname] = conds
+
+        # All users — include conditions
+        all_users = self.get_all_users()
+        for u in all_users:
+            uname = u.get('username', '')
+            u['conditions'] = [c['condition'] for c in all_conditions.get(uname, [])]
+
         return {
             'total_souls':   len(self.users),
             'total_events':  len(self.events),
             'total_bonds':   len(self.bonds),
             'choir_count':   self.choir_count,
+            'conclave_count': self.conclave_count,
             'recent_lore':   self.get_recent_lore(4),
             'ghost_tales':   self.get_ghost_tales(2),
             'world_age':     _world_age_str(self.created),
             'season':        season_name,
+            'season_idx':    season_idx,
             'soul_counts':   soul_counts,
             'regions_known': list({self._region_for(u) for u in self.users}),
+            'region_map':    region_map,
             'legend':        _rng(f'legend_pick:{int(time.time() // 7200)}').choice(
                                  list(self.legends.values())) if self.legends else None,
             'all_bonds':     self.get_all_bonds(),
-            'all_users':     self.get_all_users(),
+            'all_users':     all_users,
             'all_legends':   list(self.legends.values()),
             'all_ghosts':    self.get_ghost_tales(20),
+            'all_prophecies': all_prophecies,
+            'all_relics':    self.relics[-50:],
+            'all_omens':     self.omens[-30:],
+            'all_vigils':    self.vigils[-30:],
+            'archive':       self.archive[-20:],
+            'tides':         current_tides,
+            'rituals':       list(self.rituals.values()),
+            'thresholds_hit': self.thresholds_hit,
+            'wanderers':     self.wanderers[-20:],
+            'all_conditions': all_conditions,
             'full_events':   [{'text': e.get('text',''), 'extra': e.get('extra',[]),
                                'type': e.get('type',''), 'user': e.get('user',''),
                                'timestamp': e.get('timestamp', 0)}
@@ -1151,4 +2411,5 @@ class WorldState:
         if username not in self.users: return None
         stored = dict(self.users[username])
         stored['sigil_svg'] = generate_sigil_svg(username, size=40)
+        stored['conditions'] = self._get_active_conditions(username)
         return stored
