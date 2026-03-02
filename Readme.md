@@ -51,5 +51,5 @@ Haven requires a host server. Drop `haven_server.py` on any machine you control,
 ---
 
 <div align="center">
-  <sub>built with care &nbsp;✦&nbsp; v3.5</sub>
+  <sub>built with care &nbsp;✦&nbsp; v4.1</sub>
 </div>
