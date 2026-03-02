@@ -40,7 +40,7 @@ Point it at your Haven server, enter a username and password, and you're in.
 
 ## ✦ Server
 
-Haven requires a companion server. Drop `haven_server.py` on any machine you control, open the port, and share the IP with whoever you want in the room. That's it — no sign-up, no cloud, no middleman.
+Haven requires a host server. Drop `haven_server.py` on any machine you control, open the port, and share the IP with whoever you want in the room. That's it — no sign-up, no cloud, no middleman.
 
 ---
 
