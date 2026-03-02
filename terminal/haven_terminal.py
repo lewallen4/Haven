@@ -4,7 +4,7 @@ haven_terminal.py — Haven terminal client for Android (Termux)
 
 Install deps:
     pkg install python
-    pip install cryptography   # for PQ crypto (optional but needed for full servers)
+    pip install cryptography   # REQUIRED for AES-256-GCM encryption
 
 Run:
     python haven_terminal.py
@@ -38,7 +38,8 @@ try:
         generate_kyber_keypair, kyber_encapsulate,
         generate_x25519_keypair, x25519_exchange,
         derive_session_key, SessionCrypto,
-        compute_wire_password_hash, pack_client_hello, unpack_server_hello,
+        compute_wire_password_hash, compute_wire_key_v2,
+        pack_client_hello, unpack_server_hello,
     )
     def _auth_response(nonce, wire_hash):
         from haven_crypto import compute_auth_response
@@ -47,10 +48,15 @@ try:
 except ImportError:
     def compute_wire_password_hash(p):
         return hashlib.sha256(p.encode()).hexdigest()
+    def compute_wire_key_v2(p):
+        _s = hashlib.sha256(b'haven-wire-key-v2-salt').digest()
+        import hmac as _hm
+        _prk = _hm.new(_s, p.encode(), hashlib.sha256).digest()
+        return _hm.new(_prk, b'haven-wire-key-v2\x01', hashlib.sha256).digest()[:32].hex()
     def _auth_response(nonce, wire_hash):
         return hashlib.sha256(f"{nonce}:{wire_hash}".encode()).hexdigest()
     def pack_client_hello(auth_resp, kyber_ct, x25519_pub, username, udp_port, color):
-        return {'type':'client_hello','auth_response':auth_resp,
+        return {'type':'login','auth_response':auth_resp,
                 'username':username,'udp_port':udp_port,'user_color':color}
     def unpack_server_hello(msg):
         return msg.get('nonce'), None, None
@@ -327,7 +333,7 @@ class HavenSession:
             sock.close(); raise ConnectionError(f'Unexpected message: {server_msg.get("type")}')
 
         nonce     = server_msg['nonce']
-        wire_hash = compute_wire_password_hash(password)
+        wire_hash = compute_wire_key_v2(password)
         auth_resp = _auth_response(nonce, wire_hash)
 
         # PQ handshake
@@ -533,6 +539,10 @@ class HavenSession:
         elif t in ('voice_start', 'voice_stop'):
             pass  # no voice in terminal client
 
+        elif t == 'error':
+            err_msg = msg.get('message', 'Unknown server error')
+            print_sys(f'Server error: {err_msg}', ERR_C)
+
     def show_users(self, target=None):
         if target:
             # Show sigil + identity for a specific user
@@ -714,9 +724,12 @@ def main():
     print_banner()
 
     if not HAVEN_CRYPTO:
-        print_sys('haven_crypto not found — install cryptography and add haven_crypto.py', WARN_C)
-        print_sys('Most Haven servers require PQ crypto. Connection will likely fail.', WARN_C)
+        print_sys('FATAL: haven_crypto not found.', ERR_C)
+        print_sys('Haven requires the cryptography library for AES-256-GCM.', ERR_C)
+        print_sys('Install:  pip install cryptography', ERR_C)
+        print_sys('Then ensure haven_crypto.py is available on the Python path.', ERR_C)
         print_sep()
+        sys.exit(1)
 
     args = sys.argv[1:]  # [host, port, username]
 

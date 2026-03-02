@@ -36,10 +36,16 @@ try:
         encrypt_voice, decrypt_voice,
         hash_password, verify_password,
         compute_auth_response, compute_wire_password_hash,
+        compute_wire_key_v2,
         pack_server_hello, unpack_client_hello,
         SessionCrypto, CRYPTO_AVAILABLE, ARGON2_AVAILABLE
     )
     HAVEN_CRYPTO = True
+    if not CRYPTO_AVAILABLE:
+        print(f"\n  ✗ FATAL: `cryptography` library not installed.")
+        print(f"  Haven requires AES-256-GCM — no fallback encryption is allowed.")
+        print(f"  Install it:  pip install cryptography\n")
+        import sys as _sys; _sys.exit(1)
 except ImportError as e:
     HAVEN_CRYPTO = False
     print(f"\n  ✗ FATAL: haven_crypto not found — {e}")
@@ -152,24 +158,39 @@ def create_ssl_context():
 # ---------- Config / Password ----------
 
 def load_or_create_config():
-    global SERVER_PASSWORD_HASH, EXPANSION_ENABLED
+    global SERVER_PASSWORD_HASH, EXPANSION_ENABLED, _HISTORY_KEY_HEX
 
     if os.path.exists(SERVER_CONFIG_FILE):
         try:
             with open(SERVER_CONFIG_FILE, 'r') as f:
                 config = json.load(f)
             stored = config.get('password_hash', '')
-            wire   = config.get('password_wire_hash', '')
             if stored:
                 if not any(stored.startswith(p) for p in ('argon2:', 'pbkdf2:', 'sha256:')):
                     stored = 'sha256:' + stored
                     _upgrade_config_hash(stored)
                 SERVER_PASSWORD_HASH = stored
                 algo = 'Argon2id' if stored.startswith('argon2:') else ('PBKDF2' if stored.startswith('pbkdf2:') else 'SHA-256 (legacy)')
-                if wire:
-                    _SERVER_AUTH_CACHE['wire_response'] = wire
+
+                # ── History key (Fix #7) ─────────────────────────────────
+                hk = config.get('history_key', '')
+                if hk and len(hk) == 64:
+                    _HISTORY_KEY_HEX = hk
+                else:
+                    # First run after upgrade — generate a fresh random key
+                    _HISTORY_KEY_HEX = secrets.token_hex(32)
+                    print(f"  ✓ Generated new history encryption key")
+                    # Try to re-encrypt existing history with the new key
+                    _migrate_history_key(config)
+
+                # ── Wire hash: NEVER loaded from disk (Fix #1) ───────────
+                # Legacy key 'password_wire_hash' is ignored and will be
+                # removed on next save_config().  Wire auth is set up from
+                # plaintext in _setup_wire_auth().
+
                 EXPANSION_ENABLED = config.get('expansion_worlds', False)
                 BANNED_IPS.update(config.get('banned_ips', []))
+                save_config()  # re-save to strip legacy wire hash & persist history key
                 return
         except Exception as e:
             print(f"  ⚠ Could not read config: {e}")
@@ -190,9 +211,45 @@ def load_or_create_config():
         break
 
     SERVER_PASSWORD_HASH = hash_password(password)
-    _SERVER_AUTH_CACHE['wire_response'] = hashlib.sha256(password.encode()).hexdigest()
+    # Wire key derived in memory — NEVER written to disk
+    _SERVER_AUTH_CACHE['wire_response'] = compute_wire_key_v2(password)
+    # Also cache v1 for backward-compat with older clients
+    _SERVER_AUTH_CACHE['wire_response_v1'] = hashlib.sha256(password.encode()).hexdigest()
+    # Generate random history key
+    _HISTORY_KEY_HEX = secrets.token_hex(32)
     save_config()
-    print(f"\n  ✓ Password hashed with {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256'} and saved.\n")
+    print(f"\n  ✓ Password hashed with {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256'} and saved.")
+    print(f"  ✓ History encryption key generated.\n")
+
+
+def _migrate_history_key(old_config):
+    """Attempt to re-encrypt chat history from old wire-hash-derived key to new random key."""
+    old_wire = old_config.get('password_wire_hash', '')
+    if not old_wire:
+        return  # no old wire hash → history was either plaintext or we can't decrypt
+    try:
+        old_key = _hmac.new(old_wire.encode(), b'history-encryption-key-v1', hashlib.sha256).digest()
+        new_key = bytes.fromhex(_HISTORY_KEY_HEX)
+        if not os.path.exists(CHAT_HISTORY_FILE):
+            return
+        with open(CHAT_HISTORY_FILE, 'r') as f:
+            wrapper = json.load(f)
+        if isinstance(wrapper, list):
+            return  # plaintext, will be encrypted on next save
+        if wrapper.get('v') != 1:
+            return
+        enc_bytes = base64.b64decode(wrapper['data'])
+        pt = _decrypt_history(enc_bytes, old_key)
+        if pt is None:
+            print("  ⚠ Could not decrypt history with old key — history will reset")
+            return
+        enc_new = _encrypt_history(pt, new_key)
+        wrapper_new = {'v': 1, 'data': base64.b64encode(enc_new).decode('ascii')}
+        with open(CHAT_HISTORY_FILE, 'w') as f:
+            json.dump(wrapper_new, f)
+        print(f"  ✓ Re-encrypted chat history with new independent key")
+    except Exception as e:
+        print(f"  ⚠ History migration failed (history may need to reset): {e}")
 
 def _upgrade_config_hash(new_hash):
     global SERVER_PASSWORD_HASH
@@ -204,11 +261,18 @@ def save_config():
     try:
         data = {'password_hash': SERVER_PASSWORD_HASH, 'expansion_worlds': EXPANSION_ENABLED,
                 'banned_ips': list(BANNED_IPS)}
-        wire = _SERVER_AUTH_CACHE.get('wire_response', '')
-        if wire:
-            data['password_wire_hash'] = wire
+        # FIX: wire hash is NEVER persisted to disk.
+        # It is derived in-memory from the plaintext at startup.
+        # History uses a separate random key (see _history_key).
+        if _HISTORY_KEY_HEX:
+            data['history_key'] = _HISTORY_KEY_HEX
         with open(SERVER_CONFIG_FILE, 'w') as f:
             json.dump(data, f, indent=2)
+        # Restrict permissions — config contains the history key
+        try:
+            os.chmod(SERVER_CONFIG_FILE, 0o600)
+        except OSError:
+            pass
     except Exception as e:
         print(f"⚠ Could not save config: {e}")
 
@@ -255,31 +319,33 @@ def sanitize_username(username):
     return re.sub(r'[^\w\-]', '', username)[:MAX_USERNAME_LENGTH]
 
 def _history_key():
-    """Derive the history encryption key from the wire hash in memory."""
-    wire = _SERVER_AUTH_CACHE.get('wire_response', '')
-    if not wire:
+    """Return the 32-byte history encryption key.
+
+    This is a random key generated once on first setup and stored in
+    server_config.json.  It is NOT derived from the server password,
+    so stealing the password hash does not compromise history.
+    """
+    if not _HISTORY_KEY_HEX:
         return None
-    return _hmac.new(wire.encode(), b'history-encryption-key-v1', hashlib.sha256).digest()
+    try:
+        return bytes.fromhex(_HISTORY_KEY_HEX)
+    except (ValueError, TypeError):
+        return None
+
+# Global: hex-encoded 32-byte random key for history encryption
+_HISTORY_KEY_HEX = ''
 
 # ---------- History Encryption (AES-256-GCM direct, no haven_crypto API) ------
 
 def _encrypt_history(data_bytes: bytes, key: bytes) -> bytes:
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        nonce = os.urandom(12)
-        ct = AESGCM(key[:32]).encrypt(nonce, data_bytes, None)
-        return b'\x02' + nonce + ct
-    except ImportError:
-        nonce = os.urandom(12)
-        h = hashlib.shake_256()
-        h.update(key + nonce + b'history-ctr')
-        ks = h.digest(len(data_bytes))
-        ct = bytes(a ^ b for a, b in zip(data_bytes, ks))
-        tag_key = _hmac.new(key, b'history-tag-' + nonce, hashlib.sha256).digest()
-        tag = _hmac.new(tag_key, ct, hashlib.sha256).digest()
-        return b'\x01' + nonce + tag + ct
+    """Encrypt history blob with AES-256-GCM. No fallback — cryptography lib required."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    ct = AESGCM(key[:32]).encrypt(nonce, data_bytes, None)
+    return b'\x02' + nonce + ct
 
 def _decrypt_history(enc_bytes: bytes, key: bytes):
+    """Decrypt history blob. Supports v2 (AES-256-GCM) and legacy v1/v0 for migration."""
     if not enc_bytes:
         return None
     version = enc_bytes[0]
@@ -292,6 +358,7 @@ def _decrypt_history(enc_bytes: bytes, key: bytes):
         except Exception:
             return None
     elif version == 0x01:
+        # Legacy SHAKE-256 format — read-only for one-time migration
         payload = enc_bytes[1:]
         if len(payload) < 44:
             return None
@@ -307,6 +374,7 @@ def _decrypt_history(enc_bytes: bytes, key: bytes):
         ks = h.digest(len(ct))
         return bytes(a ^ b for a, b in zip(ct, ks))
     else:
+        # Legacy: no version byte — SHAKE-256 format (read-only migration)
         payload = enc_bytes
         if len(payload) < 44:
             return None
@@ -632,15 +700,24 @@ def handle_tcp_client(conn, addr):
 
                 if mtype == 'login':
                     provided = msg.get('auth_response', '')
-                    expected = _SERVER_AUTH_CACHE.get('wire_response', '')
-                    if not expected:
+                    # Try v2 wire key first, then v1 for backward compat
+                    expected_v2 = _SERVER_AUTH_CACHE.get('wire_response', '')
+                    expected_v1 = _SERVER_AUTH_CACHE.get('wire_response_v1', '')
+                    if not expected_v2 and not expected_v1:
                         log_action(f'Auth cache miss from {ip}')
                         send_json(conn, {'type': 'auth_failed'})
                         return
 
-                    expected_response = hashlib.sha256(f"{nonce}:{expected}".encode()).hexdigest()
+                    auth_ok = False
+                    for expected in (expected_v2, expected_v1):
+                        if not expected:
+                            continue
+                        expected_response = hashlib.sha256(f"{nonce}:{expected}".encode()).hexdigest()
+                        if _hmac.compare_digest(provided, expected_response):
+                            auth_ok = True
+                            break
 
-                    if not _hmac.compare_digest(provided, expected_response):
+                    if not auth_ok:
                         send_json(conn, {'type': 'auth_failed'})
                         log_action(f'Failed auth from {ip} (user: {msg.get("username","?")})')
                         _record_auth_failure(ip)
@@ -683,9 +760,9 @@ def handle_tcp_client(conn, addr):
 
                     crypto_info = {
                         'enabled': HAVEN_CRYPTO and session is not None,
-                        'kem': 'kyber512+x25519' if HAVEN_CRYPTO else 'none',
-                        'chat_enc': 'aes-256-gcm' if CRYPTO_AVAILABLE else 'shake256-hmac',
-                        'voice_enc': 'chacha20-poly1305' if CRYPTO_AVAILABLE else 'shake256-hmac',
+                        'kem': 'kyber512+x25519',
+                        'chat_enc': 'aes-256-gcm',
+                        'voice_enc': 'aes-256-gcm',
                         'pw_kdf': 'argon2id' if ARGON2_AVAILABLE else 'pbkdf2-sha256',
                     }
                     send_json(conn, {'type': 'auth_ok', 'user_color': user_color,
@@ -705,7 +782,7 @@ def handle_tcp_client(conn, addr):
                                                     if i.get('authenticated') and u != username]
                                     online_count = len(online_now) + 1
 
-                                world_identity, _arrival_lore, _bond_lore, _prophecy_lore = \
+                                world_identity, _arrival_lore, _bond_lore, _prophecy_lore, _extra_lore = \
                                     _world_state.register_user(username, online_users=online_now)
 
                                 # Choir (5+ users) or gathering (3-4) — silent, world panel only
@@ -761,7 +838,21 @@ def handle_tcp_client(conn, addr):
 
                 if mtype == 'chat':
                     if msg.get('encrypted') and session:
-                        plaintext = session.decrypt_chat(msg.get('ct', ''))
+                        ct_b64 = msg.get('ct', '')
+                        # Check for legacy encryption format (downgrade protection)
+                        try:
+                            raw = base64.b64decode(ct_b64)
+                            if len(raw) > 0 and raw[0] != 0x03:
+                                log_action(f'Legacy encryption from {username} — requesting client update')
+                                send_json(conn, {
+                                    'type': 'error',
+                                    'message': 'Your client is using outdated encryption. '
+                                               'Please update to the latest Haven client for AES-256-GCM support.'
+                                })
+                                continue
+                        except Exception:
+                            pass
+                        plaintext = session.decrypt_chat(ct_b64)
                         if plaintext is None:
                             log_action(f'Decryption failed from {username} — message dropped')
                             continue
@@ -779,6 +870,27 @@ def handle_tcp_client(conn, addr):
                         log_action(f'Chat from {username}: {plaintext[:80]}')
                         broadcast_encrypted_chat(username, plaintext, exclude_conn=conn)
                         add_to_history(username, plaintext)
+
+                        # Expansion Worlds — record message for Tides (content-blind)
+                        with _world_state_lock:
+                            if EXPANSION_ENABLED and _world_state is not None and HAVEN_WORLD:
+                                try:
+                                    with clients_lock:
+                                        online_now = [u for u, i in clients.items()
+                                                      if i.get('authenticated')]
+                                    tide_lore = _world_state.record_message(username, online_now)
+                                    if tide_lore:
+                                        world_summary = _world_state.get_world_summary()
+                                        with clients_lock:
+                                            for oc in [i['tcp'] for i in clients.values()
+                                                       if i.get('authenticated')]:
+                                                try:
+                                                    send_json(oc, {'type': 'world_update',
+                                                                   'summary': world_summary})
+                                                except Exception:
+                                                    pass
+                                except Exception as e:
+                                    log_action(f'World tide error: {e}')
 
                 elif mtype == 'history_page':
                     # Client requesting an older page of chat history
@@ -1093,6 +1205,17 @@ def udp_server():
 _SERVER_AUTH_CACHE = {}
 
 def _setup_wire_auth():
+    """Derive wire auth keys from the plaintext password (in-memory only).
+
+    Password sources (in priority order):
+      1. Already cached (from first-time setup in load_or_create_config)
+      2. HAVEN_PASSWORD environment variable (for headless/service operation)
+      3. Interactive prompt (stdin)
+
+    The wire key is held in memory and never written to disk.
+    For systemd services, set HAVEN_PASSWORD in an EnvironmentFile
+    with mode 0600 owned by root.
+    """
     if _SERVER_AUTH_CACHE.get('wire_response'):
         return True
 
@@ -1101,14 +1224,34 @@ def _setup_wire_auth():
             with open(SERVER_CONFIG_FILE, 'r') as f:
                 stored = json.load(f).get('password_hash', '')
             if stored:
-                pw = getpass.getpass("  Enter server password (one-time — will be cached): ")
-                if not verify_password(pw, stored):
-                    print("  ✗ Wrong password.")
-                    sys.exit(1)
-                wire_hash = hashlib.sha256(pw.encode()).hexdigest()
-                _SERVER_AUTH_CACHE['wire_response'] = wire_hash
-                save_config()
-                print("  ✓ Wire auth cached. Future startups will not require a password prompt.")
+                # Try environment variable first (headless / systemd)
+                pw = os.environ.get('HAVEN_PASSWORD', '')
+                if pw:
+                    if not verify_password(pw, stored):
+                        print("  ✗ HAVEN_PASSWORD env var contains wrong password.")
+                        sys.exit(1)
+                    print("  ✓ Password accepted from HAVEN_PASSWORD environment variable")
+                else:
+                    # Interactive prompt
+                    if not sys.stdin.isatty():
+                        print("  ✗ No interactive terminal and HAVEN_PASSWORD not set.")
+                        print("  Set HAVEN_PASSWORD in your environment or systemd EnvironmentFile.")
+                        sys.exit(1)
+                    pw = getpass.getpass("  Enter server password: ")
+                    if not verify_password(pw, stored):
+                        print("  ✗ Wrong password.")
+                        sys.exit(1)
+
+                # Derive BOTH v1 (SHA256) and v2 (HKDF) wire keys in memory
+                _SERVER_AUTH_CACHE['wire_response']    = compute_wire_key_v2(pw)
+                _SERVER_AUTH_CACHE['wire_response_v1'] = hashlib.sha256(pw.encode()).hexdigest()
+
+                # Clear the password from the env to minimize exposure window
+                if 'HAVEN_PASSWORD' in os.environ:
+                    os.environ['HAVEN_PASSWORD'] = 'x' * len(pw)
+                    del os.environ['HAVEN_PASSWORD']
+
+                print("  ✓ Wire auth derived (memory only — not written to disk)")
                 return True
         except Exception as e:
             print(f"  ✗ Error: {e}")
@@ -1196,11 +1339,12 @@ def admin_console():
                     print("  ✗ Mismatch"); continue
                 global SERVER_PASSWORD_HASH
                 SERVER_PASSWORD_HASH = hash_password(pw)
-                wire_hash = hashlib.sha256(pw.encode()).hexdigest()
-                _SERVER_AUTH_CACHE['wire_response'] = wire_hash
+                # Wire keys in memory only — never persisted
+                _SERVER_AUTH_CACHE['wire_response']    = compute_wire_key_v2(pw)
+                _SERVER_AUTH_CACHE['wire_response_v1'] = hashlib.sha256(pw.encode()).hexdigest()
                 save_config()
                 log_action('Admin changed server password')
-                print('  ✓ Password updated and cached. Existing sessions remain active.')
+                print('  ✓ Password updated. Wire keys in memory only. Existing sessions remain active.')
             except Exception as e:
                 print(f'  ✗ Error: {e}')
 
@@ -1208,13 +1352,13 @@ def admin_console():
             print(f"\n  Crypto status:")
             print(f"  haven_crypto module : {'loaded' if HAVEN_CRYPTO else 'MISSING'}")
             if HAVEN_CRYPTO:
-                print(f"  cryptography lib    : {'yes' if CRYPTO_AVAILABLE else 'no (stdlib fallback)'}")
+                print(f"  cryptography lib    : yes (required)")
                 print(f"  argon2-cffi         : {'yes' if ARGON2_AVAILABLE else 'no (PBKDF2 fallback)'}")
                 print(f"  KEM                 : Kyber-512 + X25519 (hybrid PQ)")
-                print(f"  Chat encryption     : {'AES-256-GCM' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC-SHA256'}")
-                print(f"  Voice encryption    : {'ChaCha20-Poly1305' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC-SHA256'}")
+                print(f"  Chat encryption     : AES-256-GCM (no fallback)")
+                print(f"  Voice encryption    : AES-256-GCM (no fallback)")
                 print(f"  History delivery    : encrypted per-recipient (AES-256-GCM)")
-                print(f"  History storage     : {'AES-256-GCM' if CRYPTO_AVAILABLE else 'SHAKE256+HMAC (legacy)'}")
+                print(f"  History storage     : AES-256-GCM (independent key)")
                 print(f"  Password KDF        : {'Argon2id' if ARGON2_AVAILABLE else 'PBKDF2-SHA256 (600k)'}")
                 with clients_lock:
                     encrypted_users = sum(1 for i in clients.values() if i.get('session'))
@@ -1375,7 +1519,8 @@ if __name__ == '__main__':
 
     load_or_create_config()
 
-    if os.path.exists(SERVER_CONFIG_FILE) and not _SERVER_AUTH_CACHE.get('wire_response'):
+    # Wire auth is always derived from plaintext at startup (never persisted)
+    if not _SERVER_AUTH_CACHE.get('wire_response'):
         _setup_wire_auth()
 
     if not ensure_tls_cert():

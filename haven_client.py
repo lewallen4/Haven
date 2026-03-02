@@ -101,7 +101,8 @@ try:
         generate_kyber_keypair, kyber_encapsulate,
         generate_x25519_keypair, x25519_exchange,
         derive_session_key, SessionCrypto,
-        compute_wire_password_hash, compute_auth_response as _crypto_auth_response,
+        compute_wire_password_hash, compute_wire_key_v2,
+        compute_auth_response as _crypto_auth_response,
         pack_client_hello, unpack_server_hello,
         hash_password as _crypto_hash_pw,
         verify_password as _crypto_verify_pw,
@@ -110,17 +111,23 @@ try:
     HAVEN_CRYPTO = True
     _frozen = getattr(sys, 'frozen', False)
 
-    if _frozen and not CRYPTO_AVAILABLE:
-        import tkinter.messagebox as _mb
-        _mb.showerror("Encryption Error",
-            "The cryptography library failed to load in the packaged exe.\n\n"
-            "Messages will fail to decrypt on the server.\n\n"
-            "Please report this build issue.")
+    if not CRYPTO_AVAILABLE:
+        # Hard block — AES-256-GCM is required, no fallback allowed.
+        # The themed dialog will be shown in HavenClient.__init__ since
+        # tkinter may not be ready yet at import time.
+        _CRYPTO_LIB_MISSING = True
+    else:
+        _CRYPTO_LIB_MISSING = False
 except ImportError as e:
     HAVEN_CRYPTO = False
     # No silent fallback — encryption is mandatory.
     # We define stubs so the module loads, but _attempt_connect will refuse to connect.
     def compute_wire_password_hash(p): return __import__('hashlib').sha256(p.encode()).hexdigest()
+    def compute_wire_key_v2(p):
+        import hashlib as _hl, hmac as _hm
+        _s = _hl.sha256(b'haven-wire-key-v2-salt').digest()
+        _prk = _hm.new(_s, p.encode(), _hl.sha256).digest()
+        return _hm.new(_prk, b'haven-wire-key-v2\x01', _hl.sha256).digest()[:32].hex()
     def _crypto_auth_response(n, h): return __import__('hashlib').sha256(f"{n}:{h}".encode()).hexdigest()
     def _crypto_hash_pw(p): raise RuntimeError("haven_crypto not loaded")
     def _crypto_verify_pw(p, s): raise RuntimeError("haven_crypto not loaded")
@@ -130,7 +137,7 @@ except ImportError as e:
 
 # ---------- Configuration ----------
 # ── Version ──────────────────────────────────────────────────────────────────
-HAVEN_VERSION   = '3.8'          # must match tag on GitHub release
+HAVEN_VERSION   = '4.1'          # must match tag on GitHub release
 GITHUB_USER     = 'lewallen4'
 GITHUB_REPO     = 'Haven'
 # The updater expects a release tagged v3.2 etc. with:
@@ -650,8 +657,10 @@ def create_tls_context():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_password_hash(password):
-    """Wire hash (SHA-256 of password). Used only on the wire, never stored."""
-    return compute_wire_password_hash(password)
+    """Wire key (HKDF-SHA256 derived). Used on the wire for challenge-response.
+    V2 uses HKDF so the stored value can't be reversed to SHA256(password).
+    The client may persist this for 'remember password' — acceptable risk."""
+    return compute_wire_key_v2(password)
 
 def compute_auth_response(nonce, password_hash):
     """Compute challenge-response for wire auth."""
@@ -909,20 +918,28 @@ class LoginScreen(tk.Toplevel):
         self._drag_y = None
 
         self.title("Haven - Connect")
-        self.configure(bg=self.t['login_bg'])
+        # ── Themed border (same as all other Haven windows) ───────────────
+        self.configure(bg=self.t.get('titlebar_sep', self.t.get('accent_4', '#333')))
         self.resizable(False, False)
         self.overrideredirect(True)
         self.withdraw()
-        self.geometry("420x610")
+
+        apply_window_icon(self)
+
+        # ── Inner frame (the actual content area inside the border) ───────
+        inner = tk.Frame(self, bg=self.t['login_bg'])
+        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        # ── Themed titlebar (same as all other Haven windows) ─────────────
+        build_themed_titlebar(inner, self.t, "Haven", on_close=self._cancel)
+
+        self.geometry("420x560")
         self.update_idletasks()
         self.update()
         x = (self.winfo_screenwidth()  // 2) - 210
-        y = (self.winfo_screenheight() // 2) - 305
-        self.geometry(f'420x610+{x}+{y}')
+        y = (self.winfo_screenheight() // 2) - 280
+        self.geometry(f'420x560+{x}+{y}')
         self.deiconify()
-
-        # Apply haven.ico even to overrideredirect windows (may not show on all platforms)
-        apply_window_icon(self)
 
         self.grab_set()
         self.lift()
@@ -930,48 +947,20 @@ class LoginScreen(tk.Toplevel):
         self.after(100, lambda: self.attributes('-topmost', False))
         self.focus_force()
 
-        # Custom title bar
-        title_bar = tk.Frame(self, bg=self.t['titlebar_bg'], height=35)
-        title_bar.pack(fill=tk.X, side=tk.TOP)
-        title_bar.pack_propagate(False)
-
-        tk.Label(title_bar, text="Haven", bg=self.t['titlebar_bg'],
-                 fg=self.t['titlebar_fg'], font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(12, 0), pady=5)
-
-        close_btn = tk.Button(title_bar, text="✕",
-                              bg=self.t['titlebar_bg'], fg=self.t['titlebar_fg'],
-                              font=('Segoe UI', 14), bd=0,
-                              activebackground=self.t['accent_2'], activeforeground='#fff',
-                              command=self._cancel, cursor='hand2', padx=8, pady=0)
-        close_btn.pack(side=tk.RIGHT, padx=5)
-
-        def start_move(event): self._drag_x = event.x; self._drag_y = event.y
-        def stop_move(event):  self._drag_x = None;    self._drag_y = None
-        def do_move(event):
-            if self._drag_x is not None:
-                dx = event.x - self._drag_x; dy = event.y - self._drag_y
-                self.geometry(f"+{self.winfo_x()+dx}+{self.winfo_y()+dy}")
-
-        title_bar.bind('<Button-1>',        start_move)
-        title_bar.bind('<ButtonRelease-1>', stop_move)
-        title_bar.bind('<B1-Motion>',       do_move)
-
-        tk.Frame(self, bg=self.t['titlebar_sep'], height=1).pack(fill=tk.X, side=tk.TOP)
-
-        tk.Label(self, text="HAVEN", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
+        tk.Label(inner, text="HAVEN", bg=self.t['login_bg'], fg=self.t['login_title_fg'],
                  font=('Segoe UI', 22, 'bold')).pack(pady=(25, 5))
-        tk.Label(self, text="Welcome Home", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
+        tk.Label(inner, text="Welcome Home", bg=self.t['login_bg'], fg=self.t['login_sub_fg'],
                  font=('Segoe UI', 10)).pack(pady=(0, 20))
 
         self.error_var = tk.StringVar(value=error_msg or '')
-        self.error_label = tk.Label(self, textvariable=self.error_var,
+        self.error_label = tk.Label(inner, textvariable=self.error_var,
                                     bg=self.t['login_error_bg'], fg=self.t['login_error_fg'],
                                     font=('Segoe UI', 10, 'bold'),
                                     padx=10, pady=8, wraplength=380)
         if error_msg:
             self.error_label.pack(fill=tk.X, padx=20, pady=(0, 10))
 
-        form = tk.Frame(self, bg=self.t['login_form_bg'])
+        form = tk.Frame(inner, bg=self.t['login_form_bg'])
         form.pack(fill=tk.X, padx=30, pady=10)
 
         def field(parent, label_text, default='', show=''):
@@ -1003,20 +992,14 @@ class LoginScreen(tk.Toplevel):
                        activeforeground=self.t['login_cursor'],
                        font=('Segoe UI', 9)).pack(side=tk.LEFT)
 
-        self.connect_btn = tk.Button(self, text="CONNECT ➤",
+        self.connect_btn = tk.Button(inner, text="CONNECT ➤",
                                      bg=self.t['login_btn_bg'], fg=self.t['login_btn_fg'],
                                      font=('Segoe UI', 13, 'bold'), relief=tk.FLAT,
                                      command=self._submit, padx=20, pady=12,
                                      cursor='hand2', activebackground=self.t['accent_1'])
         self.connect_btn.pack(pady=(20, 6), padx=30, fill=tk.X)
 
-        tk.Button(self, text="⬇  Check for Updates",
-                  bg=self.t['login_form_bg'], fg=self.t['login_sub_fg'],
-                  font=('Segoe UI', 9), relief=tk.FLAT,
-                  command=lambda: check_for_updates(self, self.t, silent=False),
-                  padx=20, pady=7, cursor='hand2',
-                  activebackground=self.t['glass_accent'],
-                  activeforeground=self.t['login_title_fg']).pack(padx=30, fill=tk.X)
+
 
         self.password_entry.bind('<Return>', lambda e: self._submit())
         self.ip_entry.bind('<Return>',       lambda e: self.username_entry.focus())
@@ -2374,10 +2357,11 @@ class SoundSettingsDialog(tk.Toplevel):
 class LoreBookDialog(tk.Toplevel):
     """
     The Lore Book — tabs as page tabs, themed, centered on screen.
-    Pages: The Record | Souls | Bonds | Legends | The Deep Record
+    Pages: The Record | The Map | Souls | Bonds | Legends | Prophecies | Relics | The Archive | The Deep Record
     """
 
-    PAGES = ["The Record", "Souls", "Bonds", "Legends", "The Deep Record"]
+    PAGES = ["The Record", "The Map", "Souls", "Bonds", "Legends",
+             "Prophecies", "Relics", "The Archive", "The Deep Record"]
 
     def __init__(self, parent, theme, summary, own_identity):
         super().__init__(parent)
@@ -2396,7 +2380,7 @@ class LoreBookDialog(tk.Toplevel):
         outer = tk.Frame(self, bg=t['glass_bg'], highlightthickness=0)
         outer.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
 
-        # ── Tab row ───────────────────────────────────────────────────────────
+        # ── Tab row (scrollable for many tabs) ──────────────────────────────
         tab_row = tk.Frame(outer, bg=t['glass_accent'])
         tab_row.pack(fill=tk.X, padx=0, pady=0)
 
@@ -2404,7 +2388,7 @@ class LoreBookDialog(tk.Toplevel):
         for i, name in enumerate(self.PAGES):
             btn = tk.Label(tab_row, text=name,
                            bg=t['glass_accent'], fg=t['accent_4'],
-                           font=('Segoe UI', 8), padx=10, pady=5, cursor='hand2')
+                           font=('Segoe UI', 7), padx=8, pady=5, cursor='hand2')
             btn.pack(side=tk.LEFT)
             btn.bind('<Button-1>', lambda e, idx=i: self._switch_page(idx))
             btn.bind('<Enter>', lambda e, b=btn: b.config(fg=t['fg_color']) if b != self._tab_btns[self._current] else None)
@@ -2414,43 +2398,38 @@ class LoreBookDialog(tk.Toplevel):
         tk.Frame(outer, bg=t['accent_4'], height=1).pack(fill=tk.X)
 
         # ── Page area ─────────────────────────────────────────────────────────
-        self._page_frame = tk.Frame(outer, bg=t['glass_bg'], width=420, height=480)
+        self._page_frame = tk.Frame(outer, bg=t['glass_bg'], width=600, height=620)
         self._page_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
         self._page_frame.pack_propagate(False)
-
-        # Close is handled by the titlebar X button
 
         self._switch_page(0)
 
         self.withdraw()
         self.update_idletasks()
         self.update_idletasks()
-        w  = max(self.winfo_reqwidth(), 440)
-        h2 = max(self.winfo_reqheight(), 560)
+        w  = max(self.winfo_reqwidth(), 620)
+        h2 = max(self.winfo_reqheight(), 700)
         sw = self.winfo_screenwidth(); sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h2}+{sw//2 - w//2}+{sh//2 - h2//2}")
         self.deiconify()
         self.lift()
         self.attributes('-topmost', True)
         self.after(100, lambda: self.attributes('-topmost', False))
-        # (non-modal)
 
     def _switch_page(self, idx):
         t = self.t
         self._current = idx
-        # Update tab styling
         for i, btn in enumerate(self._tab_btns):
             if i == idx:
                 btn.config(bg=t['glass_bg'], fg=t['send_btn_fg'],
-                           font=('Segoe UI', 8, 'bold'))
+                           font=('Segoe UI', 7, 'bold'))
             else:
                 btn.config(bg=t['glass_accent'], fg=t['accent_4'],
-                           font=('Segoe UI', 8))
+                           font=('Segoe UI', 7))
 
         for w in self._page_frame.winfo_children():
             w.destroy()
 
-        # Scrollable content area
         canvas = tk.Canvas(self._page_frame, bg=t['glass_bg'],
                            highlightthickness=0, bd=0)
         sb = make_scrollbar(self._page_frame, t, orient=tk.VERTICAL, command=canvas.yview)
@@ -2464,25 +2443,27 @@ class LoreBookDialog(tk.Toplevel):
             scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(cwin, width=e.width))
 
-        # Mousewheel — scoped to canvas only, guarded against destroyed widget
         def _mw(event):
             if canvas.winfo_exists():
                 canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         canvas.bind('<MouseWheel>', _mw)
         content.bind('<MouseWheel>', _mw)
 
-        # Build page
         builders = [
             self._page_record,
+            self._page_map,
             self._page_souls,
             self._page_bonds,
             self._page_legends,
+            self._page_prophecies,
+            self._page_relics,
+            self._page_archive,
             self._page_deep_record,
         ]
         builders[idx](content)
 
     def _lbl(self, parent, text, color=None, bold=False, italic=False,
-             pady=4, padx=16, wrap=380, size=8):
+             pady=4, padx=16, wrap=560, size=9):
         t = self.t
         style = 'bold italic' if bold and italic else 'bold' if bold else 'italic' if italic else 'normal'
         tk.Label(parent, text=text, bg=t['glass_bg'],
@@ -2496,7 +2477,13 @@ class LoreBookDialog(tk.Toplevel):
 
     def _head(self, parent, text):
         self._lbl(parent, text, color=self.t.get('accent_1','#00ff88'),
-                  bold=True, size=9, pady=10)
+                  bold=True, size=11, pady=10)
+
+    def _subhead(self, parent, text):
+        self._lbl(parent, text, color=self.t.get('accent_1','#00ff88'),
+                  bold=True, italic=True, size=9, pady=6)
+
+    # ── PAGE: The Record ──────────────────────────────────────────────────────
 
     def _page_record(self, p):
         t = self.t; s = self.summary
@@ -2517,19 +2504,42 @@ class LoreBookDialog(tk.Toplevel):
 
         self._lbl(p, f"{s.get('total_bonds',0)} bonds have been recorded between souls.", italic=True)
         self._lbl(p, f"{s.get('total_events',0)} events are in the record.")
+        regions = s.get('regions_known', [])
+        if regions:
+            self._lbl(p, f"{len(regions)} regions have been discovered.")
         choir = s.get('choir_count', 0)
         if choir:
             self._lbl(p, f"The Choir has convened {choir} time{'s' if choir > 1 else ''}.", italic=True,
                      color=t.get('accent_1'))
+        conclave = s.get('conclave_count', 0)
+        if conclave:
+            self._lbl(p, f"The Conclave has occurred {conclave} time{'s' if conclave > 1 else ''}.", italic=True,
+                     color=t.get('accent_1'))
+        relics = s.get('all_relics', [])
+        if relics:
+            self._lbl(p, f"{len(relics)} relics have been left behind or found.", italic=True)
+        omens = s.get('all_omens', [])
+        if omens:
+            self._lbl(p, f"{len(omens)} omens have been witnessed.", italic=True)
+        rituals = s.get('rituals', [])
+        if rituals:
+            self._lbl(p, f"{len(rituals)} rituals have been observed.", italic=True)
+        wanderers = s.get('wanderers', [])
+        if wanderers:
+            self._lbl(p, f"{len(wanderers)} wanderers have been sighted.", italic=True)
+        thresholds = s.get('thresholds_hit', [])
+        if thresholds:
+            self._lbl(p, f"{len(thresholds)} thresholds have been crossed.", italic=True)
+
         self._sep(p)
-        self._head(p, "RECENT RECORD")
+        self._subhead(p, "RECENT RECORD")
         for line in s.get('recent_lore', []):
             self._lbl(p, line, italic=True, color=t['accent_4'], pady=2)
 
         own = self.own_identity
         if own:
             self._sep(p)
-            self._head(p, "YOUR RECORD")
+            self._subhead(p, "YOUR RECORD")
             soul = own.get('soul_type', 'mortal')
             soul_label = {'seraph': '✦ Seraph', 'daemon': '⬡ Daemon', 'mortal': '· Mortal'}.get(soul, soul)
             self._lbl(p, soul_label, color=t.get('accent_1'), bold=True, pady=2)
@@ -2538,6 +2548,61 @@ class LoreBookDialog(tk.Toplevel):
             if own.get('faction'): self._lbl(p, own['faction'], italic=True, pady=2)
             if own.get('trait'): self._lbl(p, f'"{own["trait"]}"', italic=True,
                                             color=t['fg_color'], pady=4)
+            if own.get('evolved_trait'):
+                self._lbl(p, f'"{own["evolved_trait"]}"', italic=True,
+                         color=t.get('accent_1'), pady=4)
+            # Soul conditions
+            own_conditions = own.get('conditions', [])
+            if own_conditions:
+                cond_names = [c.get('condition', '').title() if isinstance(c, dict) else str(c).title()
+                             for c in own_conditions]
+                self._lbl(p, f"Active conditions: {' · '.join(cond_names)}", color='#ccaa66', pady=2)
+            visits = own.get('visit_count', 0)
+            if visits > 1:
+                self._lbl(p, f"Visits: {visits}", color=t['accent_4'], pady=2)
+
+    # ── PAGE: The Map ─────────────────────────────────────────────────────────
+
+    def _page_map(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  THE MAP")
+        self._lbl(p, "The known regions of the world and what the record holds about them.",
+                 italic=True, color=t['accent_4'], pady=2)
+        self._sep(p)
+
+        region_map = s.get('region_map', {})
+        if not region_map:
+            self._lbl(p, "No regions have been mapped yet.", italic=True, color=t['accent_4'])
+            return
+
+        sorted_regions = sorted(region_map.items(), key=lambda x: x[1].get('events', 0), reverse=True)
+        state_colors = {
+            'neutral': t['accent_4'], 'resonant': t.get('accent_1','#00ff88'),
+            'scorched': '#ff6644', 'hollowed': '#886666',
+            'tethered': t.get('accent_1','#00ff88'), 'illuminated': '#ffdd88',
+            'darkened': '#884466', 'renewed': '#66ccaa',
+            'forgotten': '#555555', 'watchful': '#aaaacc',
+            'kindled': '#ffaa44', 'haunted': t.get('accent_2','#cc4444'),
+            'blessed': '#ddddff', 'ancient': '#aa9977', 'stirring': '#ccaa44',
+        }
+        for rname, rdata in sorted_regions:
+            souls = rdata.get('souls', [])
+            events = rdata.get('events', 0)
+            rstate = rdata.get('state', 'neutral')
+            state_desc = rdata.get('state_desc', '')
+            state_color = state_colors.get(rstate, t['accent_4'])
+            self._lbl(p, rname, bold=True, color=t.get('accent_1'), pady=6)
+            if rstate != 'neutral':
+                self._lbl(p, state_desc, italic=True, color=state_color, pady=1)
+            self._lbl(p, f"{len(souls)} soul{'s' if len(souls) != 1 else ''} known  ·  {events} events recorded",
+                     color=t['accent_4'], pady=1)
+            soul_names = ', '.join(souls[:8])
+            if len(souls) > 8:
+                soul_names += f' + {len(souls) - 8} more'
+            self._lbl(p, soul_names, italic=True, pady=1)
+            tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+
+    # ── PAGE: Souls ───────────────────────────────────────────────────────────
 
     def _page_souls(self, p):
         t = self.t; s = self.summary
@@ -2549,19 +2614,35 @@ class LoreBookDialog(tk.Toplevel):
         self._lbl(p, f"{len(all_users)} souls in the record.", italic=True, pady=2)
         self._sep(p)
         soul_icons = {'seraph': '✦', 'daemon': '⬡', 'mortal': '·'}
+        soul_colors = {
+            'seraph': t.get('accent_1','#00ff88'),
+            'daemon': t.get('accent_2','#cc4444'),
+            'mortal': t['fg_color'],
+        }
         for u in all_users:
             soul  = u.get('soul_type', 'mortal')
             icon  = soul_icons.get(soul, '·')
             uname = u.get('username', '')
             self._lbl(p, f"{icon}  {uname}", bold=True, pady=8,
-                     color={'seraph': t.get('accent_1','#00ff88'),
-                             'daemon': t.get('accent_2','#cc4444'),
-                             'mortal': t['fg_color']}.get(soul, t['fg_color']))
+                     color=soul_colors.get(soul, t['fg_color']))
             if u.get('title'): self._lbl(p, u['title'], pady=1, color=t['accent_4'])
             if u.get('origin'): self._lbl(p, u['origin'], pady=1, color=t['accent_4'])
             if u.get('faction'): self._lbl(p, u['faction'], italic=True, pady=1, color=t['accent_4'])
-            if u.get('trait'): self._lbl(p, f'"{u["trait"]}"', italic=True, pady=4)
+            if u.get('trait'): self._lbl(p, f'"{u["trait"]}"', italic=True, pady=2)
+            if u.get('evolved_trait'):
+                self._lbl(p, f'"{u["evolved_trait"]}"', italic=True,
+                         color=t.get('accent_1'), pady=2)
+            conditions = u.get('conditions', [])
+            if conditions:
+                cond_str = '  ·  '.join(c.title() for c in conditions)
+                self._lbl(p, f"Conditions: {cond_str}", color='#ccaa66', size=8, pady=2)
+            visits = u.get('visit_count', 0)
+            if visits > 1:
+                self._lbl(p, f"Visits: {visits}" + (' · Soul evolved' if u.get('evolved') else ''),
+                         color=t['accent_4'], size=7, pady=1)
             tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=1)
+
+    # ── PAGE: Bonds ───────────────────────────────────────────────────────────
 
     def _page_bonds(self, p):
         t = self.t; s = self.summary
@@ -2578,12 +2659,21 @@ class LoreBookDialog(tk.Toplevel):
             a = bond.get('a',''); b = bond.get('b','')
             count  = bond.get('count', 0)
             region = bond.get('region','')
-            depth  = "Deep bond" if count >= 5 else "Known to each other"
+            if count >= 10:
+                depth = "Unbreakable bond"
+            elif count >= 5:
+                depth = "Deep bond"
+            elif count >= 3:
+                depth = "Growing bond"
+            else:
+                depth = "Known to each other"
             self._lbl(p, f"{a}  ·  {b}", bold=True, pady=8, color=t.get('accent_1'))
             self._lbl(p, f"{depth}  ·  {count} meeting{'s' if count > 1 else ''}", pady=1,
                      color=t['accent_4'])
             if region: self._lbl(p, f"Last in {region}", italic=True, pady=1, color=t['accent_4'])
             tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=1)
+
+    # ── PAGE: Legends & Hauntings ─────────────────────────────────────────────
 
     def _page_legends(self, p):
         t = self.t; s = self.summary
@@ -2591,7 +2681,7 @@ class LoreBookDialog(tk.Toplevel):
 
         legends = s.get('all_legends', [])
         if legends:
-            self._lbl(p, "— regional legends —", italic=True, color=t['accent_4'], pady=2)
+            self._subhead(p, "— regional legends —")
             for leg in legends:
                 self._lbl(p, leg, italic=True, pady=4)
                 tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
@@ -2599,8 +2689,7 @@ class LoreBookDialog(tk.Toplevel):
         ghosts = s.get('all_ghosts', [])
         if ghosts:
             self._sep(p)
-            self._lbl(p, "— from the ghost records —", italic=True,
-                     color=t.get('accent_2','#cc4444'), pady=2)
+            self._subhead(p, "— from the ghost records —")
             for tale in ghosts:
                 self._lbl(p, tale, italic=True, color=t.get('accent_2','#cc4444'), pady=4)
                 tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
@@ -2612,6 +2701,144 @@ class LoreBookDialog(tk.Toplevel):
                      italic=True, color=t['accent_4'], pady=2)
             self._lbl(p, "Ghost tales appear when souls have been absent for more than 7 days.",
                      italic=True, color=t['accent_4'], pady=2)
+
+    # ── PAGE: Prophecies & Omens ──────────────────────────────────────────────
+
+    def _page_prophecies(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  PROPHECIES & OMENS")
+
+        prophecies = s.get('all_prophecies', [])
+        omens = s.get('all_omens', [])
+
+        if prophecies:
+            self._subhead(p, "— from the deep record —")
+            for pr in reversed(prophecies[-20:]):
+                user = pr.get('user', '')
+                ts = pr.get('timestamp', 0)
+                if ts:
+                    dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d')
+                    self._lbl(p, dt, color=t['accent_4'], size=7, pady=4)
+                self._lbl(p, pr.get('text', ''), italic=True,
+                         color=t.get('accent_1', '#00ff88'), pady=2)
+                if user:
+                    self._lbl(p, f"concerning: {user}", color=t['accent_4'], size=7, pady=1)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+        else:
+            self._lbl(p, "No prophecies have been recorded.", italic=True, color=t['accent_4'])
+            self._lbl(p, "Prophecies emerge rarely (~8% chance) when souls arrive.",
+                     italic=True, color=t['accent_4'], pady=2)
+
+        if omens:
+            self._sep(p)
+            self._subhead(p, "— omens of the season —")
+            for om in reversed(omens[-15:]):
+                ts = om.get('timestamp', 0)
+                if ts:
+                    dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
+                    self._lbl(p, dt, color=t['accent_4'], size=7, pady=4)
+                self._lbl(p, om.get('text', ''), italic=True,
+                         color=t.get('accent_2', '#cc4444'), pady=2)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+
+    # ── PAGE: Relics & Vigils ─────────────────────────────────────────────────
+
+    def _page_relics(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  RELICS & VIGILS")
+
+        relics = s.get('all_relics', [])
+        vigils = s.get('all_vigils', [])
+
+        if relics:
+            self._subhead(p, "— objects left behind —")
+            for rel in reversed(relics[-20:]):
+                text = rel.get('text', '')
+                if text:
+                    self._lbl(p, text, italic=True, pady=4)
+                else:
+                    obj = rel.get('object', 'something')
+                    leaver = rel.get('leaver', 'someone')
+                    region = rel.get('region', 'an unknown region')
+                    found = rel.get('found', False)
+                    status = "Found." if found else "Not yet found."
+                    self._lbl(p, f"{obj}", bold=True, pady=4, color=t.get('accent_1'))
+                    self._lbl(p, f"Left by {leaver} in {region}. {status}",
+                             italic=True, color=t['accent_4'], pady=1)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+        else:
+            self._lbl(p, "No relics have been recorded yet.", italic=True, color=t['accent_4'])
+            self._lbl(p, "Souls sometimes leave objects behind when they depart. Others may find them.",
+                     italic=True, color=t['accent_4'], pady=2)
+
+        if vigils:
+            self._sep(p)
+            self._subhead(p, "— the vigil (late-hour watches) —")
+            for vig in reversed(vigils[-15:]):
+                ts = vig.get('timestamp', 0)
+                if ts:
+                    dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
+                    self._lbl(p, dt, color=t['accent_4'], size=7, pady=4)
+                self._lbl(p, vig.get('text', ''), italic=True, pady=2)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+
+    # ── PAGE: The Archive ─────────────────────────────────────────────────────
+
+    def _page_archive(self, p):
+        t = self.t; s = self.summary
+        self._head(p, "✦  THE ARCHIVE")
+        self._lbl(p, "Observations the world has accumulated over time.",
+                 italic=True, color=t['accent_4'], pady=2)
+        self._lbl(p, "The archive watches. It does not intervene. It notes.",
+                 italic=True, color=t['accent_4'], pady=2)
+        self._sep(p)
+
+        archive = s.get('archive', [])
+        if archive:
+            for entry in reversed(archive):
+                ts = entry.get('timestamp', 0)
+                if ts:
+                    dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
+                    self._lbl(p, dt, color=t['accent_4'], size=7, pady=4)
+                self._lbl(p, entry.get('text', ''), italic=True, pady=2)
+                tk.Frame(p, bg=t['glass_accent'], height=1).pack(fill=tk.X, padx=16, pady=2)
+        else:
+            self._lbl(p, "The archive is new. It has not yet accumulated enough to observe patterns.",
+                     italic=True, color=t['accent_4'])
+            self._lbl(p, "Observations form as the world ages. The archive is patient.",
+                     italic=True, color=t['accent_4'], pady=2)
+
+        # World statistics as the archive might present them
+        self._sep(p)
+        self._subhead(p, "— the archive's statistics —")
+        total_e = s.get('total_events', 0)
+        total_s = s.get('total_souls', 0)
+        total_b = s.get('total_bonds', 0)
+        if total_s > 0:
+            events_per_soul = total_e / total_s
+            self._lbl(p, f"Events per soul: {events_per_soul:.1f} (average)",
+                     color=t['accent_4'], pady=2)
+        if total_s > 1 and total_b > 0:
+            bond_ratio = total_b / (total_s * (total_s - 1) / 2) * 100
+            self._lbl(p, f"Bond density: {bond_ratio:.1f}% of possible connections",
+                     color=t['accent_4'], pady=2)
+        soul_counts = s.get('soul_counts', {})
+        if soul_counts:
+            parts = []
+            for stype in ('mortal', 'seraph', 'daemon'):
+                c = soul_counts.get(stype, 0)
+                if c:
+                    pct = c / total_s * 100
+                    parts.append(f"{stype}: {c} ({pct:.0f}%)")
+            if parts:
+                self._lbl(p, "Soul distribution: " + ', '.join(parts),
+                         color=t['accent_4'], pady=2)
+        regions = s.get('regions_known', [])
+        if regions:
+            self._lbl(p, f"Regions mapped: {len(regions)}",
+                     color=t['accent_4'], pady=2)
+
+    # ── PAGE: The Deep Record ─────────────────────────────────────────────────
 
     def _page_deep_record(self, p):
         t = self.t; s = self.summary
@@ -2633,14 +2860,38 @@ class LoreBookDialog(tk.Toplevel):
             'silence':       t['accent_4'],
             'gathering':     t.get('accent_1','#00ff88'),
             'choir':         t.get('accent_1','#00ff88'),
+            'omen':          t.get('accent_2','#cc4444'),
+            'relic':         t.get('accent_1','#00ff88'),
+            'vigil':         t['fg_color'],
+            'evolution':     t.get('accent_1','#00ff88'),
+            'convergence':   t.get('accent_1','#00ff88'),
+            'tide':          '#aaccff',
+            'ritual':        '#ccaa66',
+            'threshold':     '#ffdd88',
+            'region_state':  '#ccaa66',
+            'conclave':      '#ddddff',
+            'summoning':     t.get('accent_2','#cc4444'),
+            'wanderer':      '#aaaacc',
+            'condition':     '#ccaa66',
+        }
+        type_icons = {
+            'first_arrival': '◆',  'arrival': '·',  'return': '↺',
+            'departure': '→',      'silence': '…',  'gathering': '◎',
+            'choir': '♪',          'omen': '⚑',     'relic': '◇',
+            'vigil': '☽',          'evolution': '✦', 'convergence': '⊕',
+            'tide': '≈',           'ritual': '⟳',   'threshold': '▲',
+            'region_state': '◈',   'conclave': '✧',  'summoning': '⊛',
+            'wanderer': '⟡',      'condition': '◉',
         }
         for e in reversed(events):
             etype = e.get('type','')
             ts    = e.get('timestamp', 0)
             color = type_colors.get(etype, t['fg_color'])
+            icon  = type_icons.get(etype, '·')
             if ts:
                 dt = datetime.datetime.fromtimestamp(ts).strftime('%b %d, %H:%M')
-                self._lbl(p, dt, color=t['accent_4'], size=7, pady=6)
+                self._lbl(p, f"{icon}  {dt}  —  {etype or 'event'}",
+                         color=t['accent_4'], size=7, pady=6)
             self._lbl(p, e.get('text',''), color=color, italic=True, pady=1)
             for extra in e.get('extra', []):
                 self._lbl(p, extra, color=t['accent_4'], italic=True, pady=1)
@@ -2693,6 +2944,20 @@ class HavenClient:
         self.name_color = config.get('name_color', self.generate_random_color())
         self.theme_name = config.get('theme', 'default')
         self.theme      = load_theme(self.theme_name)
+
+        # ── Hard crypto guard — AES-256-GCM required, no fallback ─────────
+        _crypto_missing = (not HAVEN_CRYPTO) or globals().get('_CRYPTO_LIB_MISSING', False)
+        if _crypto_missing:
+            _themed_error(self.root, self.theme, "Haven — Encryption Required",
+                "The cryptography library is not installed.\n\n"
+                "Haven requires AES-256-GCM encryption.\n"
+                "No fallback is allowed — this prevents downgrade attacks.\n\n"
+                "Install it and restart:\n"
+                "    pip install cryptography",
+                width=460)
+            self.root.destroy()
+            return
+
         self.sounds_enabled     = config.get('sounds_enabled', True)
         self.sfx_volume         = config.get('sfx_volume', 100)
         self.user_volumes       = config.get('user_volumes', {})
@@ -2745,6 +3010,17 @@ class HavenClient:
             result = self._attempt_connect(server_ip, saved_username, password='', wire_hash=saved_wire_hash)
             if result == 'ok':
                 connected = True
+            elif result == 'crypto_downgrade':
+                _themed_error(self.root, self.theme,
+                    "Haven — Encryption Mismatch",
+                    "The server is not using AES-256-GCM encryption.\n\n"
+                    "This may indicate an outdated server or a downgrade attack.\n"
+                    "Connection refused for your security.\n\n"
+                    "Ask the server operator to update to the latest Haven.",
+                    width=460)
+                connected = self._run_login_loop(config, prefill={
+                    'server_ip': server_ip, 'username': saved_username, 'password': ''},
+                    error_msg="⚠  Server encryption too weak — update required.")
             elif result == 'auth_failed':
                 connected = self._run_login_loop(config, prefill={
                     'server_ip': server_ip, 'username': saved_username, 'password': ''},
@@ -2912,8 +3188,7 @@ class HavenClient:
                 if data['remember']:
                     # Argon2/PBKDF2 hash — strong storage, never leaves disk
                     config['password_hash']      = hash_password_for_storage(data['password'])
-                    # Wire hash — SHA256(password), all we need for auto-reconnect.
-                    # Not reversible to plaintext; not usable as a password anywhere else.
+                    # Wire key (HKDF-derived), all we need for auto-reconnect.
                     config['password_wire_hash'] = compute_password_hash(data['password'])
                 else:
                     # Clear all password data (including any legacy plaintext)
@@ -2925,6 +3200,17 @@ class HavenClient:
                 self.saved_wire_hash = compute_password_hash(data['password']) if data['remember'] else None
                 self.save_config()
                 return True
+            elif result == 'crypto_downgrade':
+                _themed_error(self.root, self.theme,
+                    "Haven — Encryption Mismatch",
+                    "The server is not using AES-256-GCM encryption.\n\n"
+                    "This may indicate an outdated server or a downgrade attack.\n"
+                    "Connection refused for your security.\n\n"
+                    "Ask the server operator to update to the latest Haven.",
+                    width=460)
+                current_error   = "⚠  Server encryption too weak — update required."
+                current_prefill = {'server_ip': data['server_ip'],
+                                   'username': data['username'], 'password': ''}
             elif result == 'auth_failed':
                 current_error   = "⚠  Incorrect password. Please try again."
                 current_prefill = {'server_ip': data['server_ip'],
@@ -3050,7 +3336,11 @@ class HavenClient:
                             self.server_assigned_color = msg['user_color']
                             self.name_color = msg['user_color']
                         crypto_info = msg.get('crypto', {})
-                        pass  # crypto active — no console noise
+                        # Reject servers that don't use AES-256-GCM (downgrade protection)
+                        server_enc = crypto_info.get('chat_enc', '')
+                        if server_enc and server_enc != 'aes-256-gcm':
+                            tcp_sock.close(); udp_sock.close()
+                            return 'crypto_downgrade'
                         # Silent startup update check (non-blocking)
                         import threading as _ut
                         _ut.Thread(target=lambda: self.root.after(5000, lambda: check_for_updates(self.root, self.theme, silent=True)), daemon=True).start()
@@ -3918,9 +4208,10 @@ class HavenClient:
             if skipped:
                 print(f"[INFO] {skipped} history entries could not be decrypted and were skipped")
         elif msg['type'] == 'userlist_full':
-            self.update_userlist_with_colors(msg['users'])
+            self.root.after(0, lambda m=msg: self.update_userlist_with_colors(m['users']))
         elif msg['type'] == 'userlist':
-            self.update_userlist_with_colors([{'username': u, 'color': t['accent_2']} for u in msg['users']])
+            self.root.after(0, lambda m=msg: self.update_userlist_with_colors(
+                [{'username': u, 'color': t['accent_2']} for u in m['users']]))
         elif msg['type'] == 'user_color_changed':
             self.update_user_color(msg['username'], msg['color'])
         elif msg['type'] == 'voice_start':
@@ -3956,9 +4247,10 @@ class HavenClient:
             self._expansion_enabled = True
             identity = msg.get('identity', {})
             summary  = msg.get('summary', {})
-            username = self.username
+            # Server may send identities for other users too — use msg username if present
+            identity_owner = msg.get('username', self.username)
             if identity:
-                self._world_identities[username] = identity
+                self._world_identities[identity_owner] = identity
             if summary:
                 self._world_summary = summary
             self.root.after(0, lambda: self.update_userlist_with_colors(self._online_users))
@@ -3975,10 +4267,15 @@ class HavenClient:
             messagebox.showerror("Kicked", "You have been kicked from the server.")
             self.root.after(0, self.on_close)
         elif msg['type'] == 'banned':
-            messagebox.showerror("Banned", "You have been banned from the server.")
-            self.root.after(0, self.on_close)
+            self.root.after(0, lambda: (
+                _themed_error(self.root, self.theme, "Haven — Banned",
+                    "You have been banned from the server.", width=400),
+                self.on_close()
+            ))
         elif msg['type'] == 'error':
-            messagebox.showerror("Error", msg['message'])
+            err_text = msg.get('message', 'Unknown server error')
+            self.root.after(0, lambda t=err_text: _themed_error(
+                self.root, self.theme, "Haven — Server Error", t, width=440))
 
     def receive_udp(self):
         while self.running:
@@ -4532,57 +4829,48 @@ class HavenClient:
 
     def add_user_to_list(self, username, color, has_voice=True):
         t        = self.theme
-        identity = self._world_identities.get(username)
+        identity = self._world_identities.get(username) if self._expansion_enabled else None
 
         card = tk.Frame(self.user_list_frame, bg=t['userlist_card_bg'],
                         highlightthickness=1, highlightbackground=t['accent_4'])
         card.pack(fill=tk.X, pady=5)
 
-        if identity and self._expansion_enabled:
-            # ── Expansion card: sigil + name + title ──────────────────────
-            inner = tk.Frame(card, bg=t['userlist_card_bg'])
-            inner.pack(fill=tk.X, padx=8, pady=6)
+        # Every user gets a sigil — it's deterministic from username, needs no server data
+        inner = tk.Frame(card, bg=t['userlist_card_bg'])
+        inner.pack(fill=tk.X, padx=8, pady=6)
 
-            # Sigil — rendered from SVG as a PhotoImage via base64 PNG fallback
-            # We draw the sigil on a small canvas using tkinter geometry
-            sigil_canvas = tk.Canvas(inner, width=44, height=44,
-                                     bg=t['userlist_card_bg'], highlightthickness=0)
-            sigil_canvas.pack(side=tk.LEFT, padx=(0, 6))
-            self._draw_sigil_on_canvas(sigil_canvas, username, color, size=44)
-            if not has_voice:
-                # Zalgo effect — ghost sigils tiled across the card
-                # Shows they exist but aren't voice-present
-                self._draw_zalgo_overlay(card, username, color)
-            self._sigil_canvases[username] = (sigil_canvas, color)
+        sigil_canvas = tk.Canvas(inner, width=44, height=44,
+                                 bg=t['userlist_card_bg'], highlightthickness=0)
+        sigil_canvas.pack(side=tk.LEFT, padx=(0, 6))
+        self._draw_sigil_on_canvas(sigil_canvas, username, color, size=44)
+        self._sigil_canvases[username] = (sigil_canvas, color)
 
-            right = tk.Frame(inner, bg=t['userlist_card_bg'])
-            right.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        right = tk.Frame(inner, bg=t['userlist_card_bg'])
+        right.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-            label = tk.Label(right, text=username,
-                             bg=t['userlist_card_bg'], fg=color,
-                             font=('Segoe UI', 10), anchor='w')
-            label.pack(fill=tk.X)
+        # Terminal users get a ◌ prefix to show they have no voice
+        prefix = "◌ " if not has_voice else ""
+        label = tk.Label(right, text=f"{prefix}{username}",
+                         bg=t['userlist_card_bg'], fg=color,
+                         font=('Segoe UI', 10), anchor='w')
+        label.pack(fill=tk.X)
 
+        # Expansion title + tooltip — only if server gave us an identity for this user
+        if identity:
             title_text = identity.get('title', '')
             if title_text:
                 tk.Label(right, text=title_text,
                          bg=t['userlist_card_bg'], fg=t['accent_4'],
                          font=('Segoe UI', 7), anchor='w').pack(fill=tk.X)
-
-            # Tooltip on hover
             self._bind_world_tooltip(card, identity)
             self._bind_world_tooltip(inner, identity)
             self._bind_world_tooltip(label, identity)
-        else:
-            # ── Standard card ─────────────────────────────────────────────
-            # Add a small "no-voice" indicator glyph when the user is terminal-only
-            prefix = "◌ " if not has_voice else "● "
-            label = tk.Label(card, text=f"{prefix}{username}",
-                             bg=t['userlist_card_bg'], fg=color,
-                             font=('Segoe UI', 10), anchor='w', padx=10, pady=8)
-            label.pack(fill=tk.X)
-            if not has_voice:
-                self._draw_zalgo_overlay(card, username, color)
+
+        # Zalgo effect for terminal users — drawn directly onto the sigil canvas
+        # as background items (tag_lower), then the main sigil redrawn on top.
+        # No separate widget, no z-order fights.
+        if not has_voice:
+            self._draw_zalgo_overlay(sigil_canvas, username, color)
 
         self.speaker_labels[username] = label
         if username in self.active_speakers:
@@ -4677,86 +4965,110 @@ class HavenClient:
                                rune_pts[0][0] + dot_r, rune_pts[0][1] + dot_r,
                                fill=color, outline='')
 
-    def _draw_zalgo_overlay(self, card, username, color):
+    def _draw_zalgo_overlay(self, sigil_canvas, username, color):
         """
-        Tile faded ghost-sigils across the user card to show a terminal/no-voice
-        user. The sigil is recognisable but fragmented — 'lost in the sauce'.
+        Zalgo / ghost-code effect for terminal (no-voice) users.
 
-        Strategy: place a canvas as the card background FIRST, then lift all
-        existing children (text labels, sigil canvas) above it so they remain
-        readable. The canvas is drawn at card-level via place() so it fills the
-        whole card behind the packed widgets.
+        Draws faint tiled ghost-sigils directly as canvas items BEHIND the
+        main sigil using tag_lower. No separate widget, no z-order fights.
+        The sigil canvas already exists and is correctly positioned — we just
+        paint the corruption into its background layer.
+
+        For the wider card area we tile ghosts across a completely transparent
+        label (no background, no border) that spans the card using place().
+        Since it contains only canvas drawings (not a Frame), tk renders it
+        correctly above the card bg but below nothing — and we set it as
+        passthrough for mouse events.
         """
-        t = self.theme
+        t           = self.theme
+        card        = sigil_canvas.master.master   # sigil_canvas → inner → card
 
-        # Dim the color way down so it ghosts behind the text
-        def _dim(hex_color, alpha=0.22):
+        def _dim(hex_color, alpha=0.30):
             try:
-                h = hex_color.lstrip('#')
-                r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-                bg_h = t['userlist_card_bg'].lstrip('#')
-                br, bg_c, bb = int(bg_h[0:2],16), int(bg_h[2:4],16), int(bg_h[4:6],16)
-                nr = int(br + (r - br) * alpha)
-                ng = int(bg_c + (g - bg_c) * alpha)
-                nb = int(bb + (b - bb) * alpha)
-                return f'#{nr:02x}{ng:02x}{nb:02x}'
+                h  = hex_color.lstrip('#')
+                r,  g,  b  = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+                bg = t['userlist_card_bg'].lstrip('#')
+                br, bg2, bb = int(bg[0:2],16), int(bg[2:4],16), int(bg[4:6],16)
+                return (f'#{int(br+(r-br)*alpha):02x}'
+                        f'{int(bg2+(g-bg2)*alpha):02x}'
+                        f'{int(bb+(b-bb)*alpha):02x}')
             except Exception:
                 return t.get('accent_4', '#444444')
 
-        ghost_color = _dim(color, 0.22)
+        ghost_color = _dim(color, 0.65)
 
-        def _do_draw(event=None):
+        # ── 1. Ghost tiles on the sigil canvas (behind the main sigil) ────────
+        # Tag all current items, draw ghosts, then lower them below existing items
+        existing = sigil_canvas.find_all()
+
+        tile = 14
+        step = tile + 4
+        rng  = random.Random(
+            int(hashlib.sha256(f'zalgo:{username}'.encode()).hexdigest(), 16))
+
+        w44, h44 = 44, 44
+        for row_y in range(-tile, h44 + tile, step):
+            x_off = rng.randint(0, step) if (row_y // step) % 2 else 0
+            for col_x in range(-tile + x_off, w44 + tile, step):
+                jx  = col_x + rng.randint(-2, 2)
+                jy  = row_y + rng.randint(-2, 2)
+                rot = rng.uniform(0, 360)
+                self._draw_sigil_on_canvas(
+                    sigil_canvas, username, ghost_color,
+                    size=tile, rotation_offset=rot, offset=(jx, jy))
+
+        # Lower all newly added items below the original sigil items
+        new_items = [i for i in sigil_canvas.find_all() if i not in existing]
+        for item in new_items:
+            sigil_canvas.tag_lower(item)
+
+        # ── 2. Full-card ghost tile on a background canvas ────────────────────
+        # Canvas is created with width=1,height=1 so it requests zero layout space,
+        # then placed with relwidth/relheight to fill the card without affecting
+        # the card's own size calculation.
+        def _draw_card_overlay():
             try:
+                if not card.winfo_exists():
+                    return
+                card.update_idletasks()
                 w = card.winfo_width()
                 h = card.winfo_height()
                 if w < 4 or h < 4:
-                    card.after(50, _do_draw)
+                    card.after(40, _draw_card_overlay)
                     return
 
-                # Create the overlay canvas with the card's own bg colour (safe, no blank bg)
-                ov = tk.Canvas(card, bg=t['userlist_card_bg'], highlightthickness=0,
-                               width=w, height=h)
-                # Place it to fill the whole card — it goes under pack-managed widgets
-                # by being placed at z-order bottom
-                ov.place(x=0, y=0, relwidth=1, relheight=1)
-                ov.lower()   # send behind all packed children
+                # width=1,height=1 — canvas requests no space from the layout manager
+                ov = tk.Canvas(card, bg=t['userlist_card_bg'],
+                               highlightthickness=0, width=1, height=1)
 
-                # Tile small ghost sigils across the card
-                tile = 18   # size of each ghost sigil
-                gap  = 6    # gap between tiles
-                step = tile + gap
+                tile2 = 18
+                step2 = tile2 + 6
+                rng2  = random.Random(
+                    int(hashlib.sha256(f'zalgo2:{username}'.encode()).hexdigest(), 16))
 
-                rng = random.Random(int(hashlib.sha256(f'zalgo:{username}'.encode()).hexdigest(), 16))
-
-                for row_y in range(-tile, h + tile, step):
-                    # Offset every other row for a staggered/chaotic feel
-                    x_off = rng.randint(0, step) if (row_y // step) % 2 else 0
-                    for col_x in range(-tile + x_off, w + tile, step):
-                        # Slight random jitter
-                        jx = col_x + rng.randint(-3, 3)
-                        jy = row_y + rng.randint(-3, 3)
-                        # Random rotation offset per tile
-                        rot = rng.uniform(0, 360)
+                for row_y in range(-tile2, h + tile2, step2):
+                    x_off = rng2.randint(0, step2) if (row_y // step2) % 2 else 0
+                    for col_x in range(-tile2 + x_off, w + tile2, step2):
+                        jx  = col_x + rng2.randint(-3, 3)
+                        jy  = row_y + rng2.randint(-3, 3)
+                        rot = rng2.uniform(0, 360)
                         self._draw_sigil_on_canvas(
                             ov, username, ghost_color,
-                            size=tile,
-                            rotation_offset=rot,
-                            offset=(jx, jy)
-                        )
+                            size=tile2, rotation_offset=rot, offset=(jx, jy))
 
-                # Lift all existing packed children above the overlay canvas
+                # relwidth/relheight fills card without pushing its size
+                ov.place(x=1, y=1, relwidth=1.0, relheight=1.0, width=-2, height=-2)
+
+                # Lift inner frame (sigil + label) above overlay
                 for child in card.winfo_children():
                     if child is not ov:
-                        try:
-                            child.lift()
-                        except Exception:
-                            pass
+                        child.lift()
 
             except Exception:
                 pass
 
-        card.bind('<Map>', _do_draw)
-        card.after(80, _do_draw)   # fallback for already-visible cards
+        card.after(80, _draw_card_overlay)
+
 
     # ── Sigil animation helpers ────────────────────────────────────────────────
 
