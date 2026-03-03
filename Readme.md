@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Haven is a self-hosted, end-to-end encrypted chat client built for small groups who want real privacy without the overhead. No accounts, no servers you don't control, no data you didn't choose to share.**
+**Haven is a self-hosted, post-quantum encrypted chat client built for small groups who want real privacy without the overhead. No accounts, no servers you don't control, no data you didn't choose to share.**
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
