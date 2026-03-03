@@ -16,7 +16,7 @@
 
 ## ✦ Features
 
-- **End-to-end encrypted** — post-quantum hybrid encryption on every message
+- **PQ encrypted** — post-quantum hybrid encryption on every message
 - **Voice chat** — push-to-talk with per-device audio routing and adjustable release delay
 - **Zero-latency sound effects** — pre-loaded PCM playback via PyAudio, no WinMM overhead
 - **TOFU certificate trust** — first-connection fingerprint pinning with a human-friendly mismatch dialog
@@ -32,6 +32,7 @@
 ```bash
 pip install pyaudio pystray pillow pynput cryptography
 python haven_client.py
+#### Or you could just grab a release from the releases section!
 ```
 
 Point it at your Haven server, enter a username and password, and you're in.
@@ -51,5 +52,5 @@ Haven requires a host server. Drop `haven_server.py` on any machine you control,
 ---
 
 <div align="center">
-  <sub>built with care &nbsp;✦&nbsp; v4.1</sub>
+  <sub>built with care &nbsp;✦&nbsp; v4.2</sub>
 </div>
