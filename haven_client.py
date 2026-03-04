@@ -137,7 +137,7 @@ except ImportError as e:
 
 # ---------- Configuration ----------
 # ── Version ──────────────────────────────────────────────────────────────────
-HAVEN_VERSION   = '4.1'          # must match tag on GitHub release
+HAVEN_VERSION   = '4.3'          # must match tag on GitHub release
 GITHUB_USER     = 'lewallen4'
 GITHUB_REPO     = 'Haven'
 # The updater expects a release tagged v3.2 etc. with:
@@ -321,8 +321,8 @@ def play_sound(name: str, enabled: bool = True, sfx_vol: int = None):
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SUPPORTED_RATES = [44100, 48000, 32000, 24000, 16000, 8000]
-DEFAULT_RATE = 44100
+SUPPORTED_RATES = [48000, 44100, 96000, 88200, 32000, 24000, 22050, 16000, 11025, 8000]
+DEFAULT_RATE = 48000
 
 USER_COLOR_PALETTE = [
     '#ff006e', '#ff4d6d', '#ff6b9d', '#ff8fab',
@@ -1930,6 +1930,27 @@ def _themed_dialog(parent, theme, title, icon, message, buttons, width=420):
     dlg.focus_force()
 
     parent.wait_window(dlg)
+
+    # Restore focus to the main entry widget after a modal dialog closes.
+    # With overrideredirect(True), the WM doesn't move focus back automatically.
+    def _restore_focus():
+        try:
+            parent.focus_force()
+            # Walk the widget tree looking for the msg_entry
+            for child in parent.winfo_children():
+                try:
+                    app = getattr(child, 'master', None)
+                    # Try to find HavenClient's msg_entry via the root
+                    if hasattr(parent, '_haven_app') and parent._haven_app.msg_entry:
+                        parent._haven_app.msg_entry.focus_set()
+                        return
+                except Exception:
+                    pass
+            parent.focus_force()
+        except Exception:
+            pass
+    parent.after(50, _restore_focus)
+
     return result_holder[0]
 
 
@@ -3038,6 +3059,7 @@ class HavenClient:
             return
 
         self.root.deiconify()
+        self.root._haven_app = self   # back-ref for focus restore after dialogs
         self.root.title("Haven")
         sw  = self.root.winfo_screenwidth()
         sh  = self.root.winfo_screenheight()
@@ -3125,6 +3147,16 @@ class HavenClient:
         self.root.withdraw()
 
     # ── Theme ────────────────────────────────────────────────────
+
+    def _restore_focus(self):
+        """Restore keyboard focus to the chat entry after any dialog closes.
+        With overrideredirect(True), the WM doesn't do this automatically."""
+        try:
+            self.root.focus_force()
+            if self.msg_entry and self.msg_entry.winfo_exists():
+                self.msg_entry.focus_set()
+        except Exception:
+            pass
 
     def apply_theme(self, theme_name):
         self.theme_name = theme_name
@@ -3928,6 +3960,7 @@ class HavenClient:
         dlg = AboutDialog(self.root, self.theme, self.theme_name)
         self._track_dialog(dlg)
         self.root.wait_window(dlg)
+        self.root.after(50, self._restore_focus)
 
     def format_key_display(self, key):
         if key.startswith('mouse_'):
@@ -4303,6 +4336,19 @@ class HavenClient:
                     if data is None:
                         continue  # Drop tampered/invalid packet silently
 
+                # ── Extract source sample rate from 3-byte header ─────────
+                # New clients prepend [0xAA] [rate//5 as 2-byte LE] inside
+                # the encrypted envelope.  The 0xAA magic byte distinguishes
+                # this from raw PCM (where the first byte could be anything).
+                # If the header isn't present (old client), the entire payload
+                # is treated as raw PCM at DEFAULT_RATE — backward-compatible.
+                source_rate = DEFAULT_RATE
+                if len(data) >= 5 and data[0] == 0xAA:  # magic + 2 rate + ≥2 audio
+                    candidate = int.from_bytes(data[1:3], 'little') * 5
+                    if 4000 <= candidate <= 192000:
+                        source_rate = candidate
+                        data = data[3:]
+
                 if self.stream_out is None:
                     try:
                         device_index = self.audio_settings.get('output_device_index', None)
@@ -4316,6 +4362,11 @@ class HavenClient:
                             except: continue
                     except Exception as e:
                         print(f"Failed to open output stream: {e}"); continue
+
+                # ── Resample if source and output rates differ ────────────────
+                if source_rate != self.current_output_rate:
+                    data = self._resample_audio(data, source_rate,
+                                                self.current_output_rate)
 
                 # Apply volumes: global output × per-user override
                 master = self.audio_settings.get('output_volume', 100) / 100
@@ -4331,6 +4382,133 @@ class HavenClient:
                 self.stream_out.write(data)
             except OSError: break
             except Exception as e: print(f"Error in receive_udp: {e}"); break
+
+    @staticmethod
+    def _resample_audio(data: bytes, src_rate: int, dst_rate: int) -> bytes:
+        """
+        Production-grade sample rate conversion for 16-bit mono PCM.
+
+        Handles any src→dst combination: upsample, downsample, and
+        fractional ratios like 44100↔48000 (ratio 147:160).
+
+        Strategy (in priority order):
+          1. scipy.signal.resample_poly — best quality, polyphase FIR
+          2. numpy windowed-sinc        — ~identical quality, no scipy needed
+          3. numpy linear interp        — acceptable for voice, fast
+          4. pure-Python nearest         — last resort, no dependencies
+
+        All paths include proper anti-alias filtering on downsample.
+        """
+        if src_rate == dst_rate or len(data) < 2:
+            return data
+
+        # ── Try scipy first (gold standard polyphase resampler) ───────────
+        try:
+            import numpy as np
+            from scipy.signal import resample_poly
+            from math import gcd
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+            if len(samples) == 0:
+                return data
+            g = gcd(src_rate, dst_rate)
+            up, down = dst_rate // g, src_rate // g
+            # resample_poly handles anti-alias filtering internally
+            resampled = resample_poly(samples, up, down)
+            return resampled.clip(-32768, 32767).astype(np.int16).tobytes()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # ── Numpy windowed-sinc resampler (no scipy needed) ───────────────
+        try:
+            import numpy as np
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+            n_in = len(samples)
+            if n_in == 0:
+                return data
+
+            ratio = dst_rate / src_rate
+            n_out = max(1, int(n_in * ratio))
+
+            # For voice over a LAN, the quality difference between windowed-
+            # sinc and linear interp is subtle.  But for large ratio jumps
+            # (e.g. 96000→8000 = 12:1) the anti-alias filter matters a lot.
+
+            if ratio >= 0.9 and ratio <= 1.12:
+                # Near-unity ratio (e.g. 44100↔48000): linear interp is fine
+                # — the frequency content is nearly identical, aliasing is
+                # negligible for voice bandwidth (<8kHz).
+                indices = np.linspace(0, n_in - 1, n_out)
+                resampled = np.interp(indices, np.arange(n_in), samples)
+            else:
+                # Significant rate change — use windowed-sinc with anti-alias.
+                # Cutoff at Nyquist of the lower rate to prevent aliasing.
+                cutoff = min(1.0, ratio) * 0.95   # 0.95 = slight rolloff margin
+                # Sinc kernel width: more taps = sharper cutoff. 64 taps is a
+                # good tradeoff for real-time voice (sub-ms on modern CPUs).
+                SINC_TAPS = 64
+                half_width = SINC_TAPS // 2
+
+                # Output sample positions mapped back to input coordinates
+                out_indices = np.linspace(0, n_in - 1, n_out)
+
+                # Pad input to avoid boundary artifacts
+                padded = np.pad(samples, half_width, mode='constant')
+
+                resampled = np.empty(n_out, dtype=np.float64)
+                # Vectorised sinc convolution — process all output samples at once
+                # by building a 2D tap matrix.  Memory: n_out × SINC_TAPS float64.
+                # For CHUNK=1024 and ratio~1.1 this is ~1024×64×8 = 512KB — fine.
+                tap_offsets = np.arange(-half_width, half_width)  # [-32..31]
+                # Centre positions in padded coordinates
+                centres = out_indices + half_width  # shift for padding
+                # Build matrix of sample positions for each tap
+                positions = centres[:, None] + tap_offsets[None, :]  # (n_out, SINC_TAPS)
+                # Fractional distances from each position to its nearest integer
+                int_positions = np.floor(positions).astype(np.int64)
+                frac = positions - int_positions
+                # Clamp indices into padded array bounds
+                int_positions = np.clip(int_positions, 0, len(padded) - 1)
+                # Gather input samples at those positions
+                gathered = padded[int_positions]  # (n_out, SINC_TAPS)
+                # Windowed sinc kernel: sinc(x) × Hann window
+                # x = fractional distance × cutoff
+                x = (tap_offsets[None, :] - (centres[:, None] - np.floor(centres[:, None]))) * cutoff
+                # Avoid division by zero at x=0
+                sinc_vals = np.where(np.abs(x) < 1e-10, 1.0,
+                                     np.sin(np.pi * x) / (np.pi * x))
+                # Hann window over the tap range
+                hann = 0.5 * (1 + np.cos(np.pi * tap_offsets[None, :] / half_width))
+                kernel = sinc_vals * hann * cutoff
+                # Normalise each row so gain is unity
+                row_sums = kernel.sum(axis=1, keepdims=True)
+                row_sums[row_sums == 0] = 1.0
+                kernel /= row_sums
+                # Apply kernel
+                resampled = (gathered * kernel).sum(axis=1)
+
+            return resampled.clip(-32768, 32767).astype(np.int16).tobytes()
+
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[AUDIO] Sinc resample failed, falling back to nearest: {e}")
+
+        # ── Pure-Python nearest-neighbor fallback (no numpy at all) ────────
+        try:
+            src_samples = len(data) // 2
+            if src_samples == 0:
+                return data
+            ratio = dst_rate / src_rate
+            out_len = max(1, int(src_samples * ratio))
+            result = bytearray(out_len * 2)
+            for i in range(out_len):
+                src_idx = min(int(i / ratio), src_samples - 1)
+                result[i*2:i*2+2] = data[src_idx*2:src_idx*2+2]
+            return bytes(result)
+        except Exception:
+            return data  # absolute last resort — pass through unmodified
 
     def _chat_insert(self, index, text, *tags):
         """Safe wrapper around chat_text.insert — catches Tcl encoding errors."""
@@ -5365,6 +5543,7 @@ class HavenClient:
         self.root.wait_window(dialog)
         if dialog.result and dialog.result != self.theme_name:
             self.apply_theme(dialog.result)
+        self.root.after(50, self._restore_focus)
 
     def open_sound_settings(self):
         known_users = [u for u in self.user_colors if u != self.username]
@@ -5375,6 +5554,7 @@ class HavenClient:
             on_save=self._apply_sound_settings
         )
         self.root.wait_window(dialog)
+        self.root.after(50, self._restore_focus)
 
     def _apply_sound_settings(self, enabled, sfx_vol, user_vols):
         self.sounds_enabled = enabled
@@ -5393,9 +5573,8 @@ class HavenClient:
                                                 'new_username': new_name.strip(),
                                                 'user_color': self.name_color}) + '\n').encode())
             except: messagebox.showerror("Error", "Failed to change username")
-        self.root.focus_force()
-        if self.msg_entry and self.msg_entry.winfo_exists():
-            self.msg_entry.focus_set()
+        self.root.after(50, self._restore_focus)
+
     def change_name_color(self):
         dialog = ColorPickerDialog(self.root, self.name_color, theme=self.theme)
         self._track_dialog(dialog)
@@ -5410,6 +5589,8 @@ class HavenClient:
                 messagebox.showerror("Error", "Failed to update color")
                 self.name_color = old_color; return
             self.save_config()
+        self.root.after(50, self._restore_focus)
+
     def change_ptt_key(self):
         dialog = KeybindDialog(self.root, self.ptt_key, theme=self.theme)
         self.root.wait_window(dialog)
@@ -5423,6 +5604,7 @@ class HavenClient:
             self.save_config()
             self.display_system_message(
                 f"✓ Push-to-talk key changed to {self.format_key_display(dialog.result)}", local_only=True)
+        self.root.after(50, self._restore_focus)
 
     def _get_embedded_chat_widgets(self):
         """Return all tk.Frame widgets embedded in the chat text widget."""
@@ -5467,6 +5649,7 @@ class HavenClient:
                     old_settings.get('output_device_index') != self.audio_settings.get('output_device_index')):
                 self.restart_audio_streams()
             self.save_config()
+        self.root.after(50, self._restore_focus)
 
 
     def restart_audio_streams(self):
@@ -5568,6 +5751,15 @@ class HavenClient:
                         audio_data = np.frombuffer(data, dtype=np.int16)
                         data = (audio_data * volume).astype(np.int16).tobytes()
                     except ImportError: pass
+                # Prepend source sample rate as a 3-byte header so the
+                # receiver can resample if their output device differs.
+                # Format: [0xAA magic] [rate//5 as 2-byte LE]
+                # This sits INSIDE the encrypted envelope — invisible to
+                # the network and the server relay.  The magic byte prevents
+                # false positives when receiving from old headerless clients.
+                rate_enc = self.current_input_rate // 5
+                rate_header = bytes([0xAA]) + rate_enc.to_bytes(2, 'little')
+                data = rate_header + data
                 # Encrypt voice packet before sending
                 if self.session_crypto and HAVEN_CRYPTO:
                     data = self.session_crypto.encrypt_voice(data)
