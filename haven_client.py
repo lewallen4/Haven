@@ -1222,7 +1222,7 @@ class KeybindDialog(tk.Toplevel):
         self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
-        build_themed_titlebar(self, self.t, "Set Push-to-Talk Key")
+        build_themed_titlebar(self, self.t, " ")
 
         tk.Label(self, text="Choose Push-to-Talk Key", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 14, 'bold')).pack(pady=18)
@@ -1379,7 +1379,7 @@ class AudioDeviceDialog(tk.Toplevel):
         self.transient(parent); # (non-modal)
         apply_window_icon(self)
 
-        build_themed_titlebar(self, self.t, "Audio Devices & Volume")
+        build_themed_titlebar(self, self.t, " ")
         tk.Label(self, text="AUDIO SETTINGS", bg=self.t['glass_bg'], fg=self.t['accent_1'],
                  font=('Segoe UI', 16, 'bold')).pack(pady=(12, 4))
 
@@ -2255,7 +2255,7 @@ class SoundSettingsDialog(tk.Toplevel):
         apply_window_icon(self)
 
         t = self.t
-        build_themed_titlebar(self, t, "Sound Settings", on_close=self.destroy)
+        build_themed_titlebar(self, t, " ", on_close=self.destroy)
 
         outer = tk.Frame(self, bg=t['glass_bg'], highlightthickness=0)
         outer.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
@@ -3826,6 +3826,25 @@ class HavenClient:
                                 self._world_identities.get(self.username, {}))
         self._track_dialog(dialog)
 
+    def _extract_identities_from_summary(self, summary):
+        """Pull per-user identity data out of the world summary's all_users list
+        and merge it into _world_identities so user list cards show titles."""
+        for user_data in summary.get('all_users', []):
+            uname = user_data.get('username', '')
+            if not uname:
+                continue
+            # Don't overwrite a direct identity from the server with summary data
+            # (the direct one may have more fields), but do fill in missing users.
+            if uname not in self._world_identities:
+                self._world_identities[uname] = user_data
+            else:
+                # Merge any new fields from summary that the existing entry lacks
+                existing = self._world_identities[uname]
+                for key in ('title', 'origin', 'faction', 'trait', 'soul_type',
+                            'evolved_trait', 'conditions', 'visit_count'):
+                    if key in user_data and key not in existing:
+                        existing[key] = user_data[key]
+
     def _refresh_world_panel(self):
         """Populate the world lore panel with current summary."""
         if not hasattr(self, '_world_lore_frame') or not self._world_panel_visible:
@@ -4286,6 +4305,7 @@ class HavenClient:
                 self._world_identities[identity_owner] = identity
             if summary:
                 self._world_summary = summary
+                self._extract_identities_from_summary(summary)
             self.root.after(0, lambda: self.update_userlist_with_colors(self._online_users))
             self.root.after(0, self._refresh_world_panel)
 
@@ -4294,6 +4314,8 @@ class HavenClient:
             summary = msg.get('summary', {})
             if summary:
                 self._world_summary = summary
+                self._extract_identities_from_summary(summary)
+            self.root.after(0, lambda: self.update_userlist_with_colors(self._online_users))
             self.root.after(0, self._refresh_world_panel)
 
         elif msg['type'] == 'kicked':
